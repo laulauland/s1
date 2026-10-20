@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use bytes::Bytes;
-use common::{Recorder, TEST_KEY, fixture, overlay_for, start_mock};
+use common::{MISSING_KEY, Recorder, TEST_KEY, fixture, overlay_for, start_mock};
 use proptest::prelude::*;
 use s1::catalog::Catalog;
 use s1::cli::client::request;
@@ -128,6 +128,38 @@ async fn raw_passes_provider_errors_through_unchanged() {
         reply.body.as_ref(),
         fixture("typesafe/invalid_key.401.json")
     );
+    assert_eq!(reply.headers["s1-backend"], "typesafe");
+    h.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn raw_returns_typesafe_403_unchanged() {
+    // `/v1/raw` is pure passthrough: no 403 -> 401 mapping (that is only on
+    // the typed `/v1/systemone` ingress).
+    let h = harness_with(Some(MISSING_KEY), None).await;
+    let reply = unix_post(
+        &h,
+        "/v1/raw/systemone",
+        json_headers(),
+        &fixture("typesafe/noul.request.json"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        reply.body.as_ref(),
+        fixture("typesafe/missing_key.403.json")
+    );
+    assert!(reply.headers.get("s1-upstream-status").is_none());
+    h.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn raw_does_not_read_image_paths() {
+    // Paths are a typed-ingress feature; raw sends the bytes as they are.
+    let h = harness().await;
+    let body = br#"{"model":"jev-latest","state":"a","questions":{"q":{"type":"noul"}},"assets":{"a":{"type":"image","s1_path":"/nonexistent/x.png"}}}"#;
+    let reply = unix_post(&h, "/v1/raw/systemone", json_headers(), body).await;
+    assert_eq!(h.mock.last().body.as_ref(), body.as_slice());
     assert_eq!(reply.headers["s1-backend"], "typesafe");
     h.server.shutdown().await;
 }

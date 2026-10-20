@@ -7,3 +7,6 @@ recorded in the provider notes (docs.typesafe.ai/api/system-one.md, 2026-10-20).
   versioned id (`jev-latest` resolves to `jev-1.13.0`).
 - `missing_key.403.json`: live body when no `Authorization` header is sent (HTTP 403).
 - `invalid_key.401.json`: live body for `Authorization: Bearer invalid` (HTTP 401).
+- `triage.response.json`: live Jev answer (2026-10-20) to the Clef doc example
+  (noul + choice + score) sent as `typesafe/jev-latest` through
+  `POST /v1/systemone`; recorded with `S1_LIVE=1 S1_RECORD=1 cargo test --test live -- --ignored`.

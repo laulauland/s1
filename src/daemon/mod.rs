@@ -1,12 +1,14 @@
 //! The daemon: one axum router served on a Unix socket (file permissions give
 //! access control) and on 127.0.0.1 TCP (bearer token from `auth.json`).
+//! Requests on the socket carry an [`Origin::UnixSocket`] extension; only
+//! they may send image file paths.
 
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::Router;
+use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::watch;
@@ -15,10 +17,12 @@ use tokio::task::JoinHandle;
 use crate::backend::{BackendContext, Registry};
 use crate::catalog::Catalog;
 use crate::config::Config;
+use crate::images::Origin;
 use crate::paths::Paths;
 use crate::secrets::{KeyResolver, Secret};
 
 mod auth;
+mod ingress;
 mod models;
 mod raw;
 mod routes;
@@ -131,6 +135,8 @@ async fn serve_inner(
 
     let app: Router = router(opts.state);
     let tcp_app = auth::require_bearer(app.clone(), opts.token);
+    // Only the socket may name local image files (see `crate::images`).
+    let app = app.layer(Extension(Origin::UnixSocket));
     let (stop, rx) = watch::channel(false);
 
     let mut rx1 = rx.clone();

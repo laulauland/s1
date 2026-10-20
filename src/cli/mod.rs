@@ -10,8 +10,10 @@ use crate::paths::Paths;
 mod auth;
 pub mod client;
 mod daemon;
+pub mod decide;
 mod models;
 mod raw;
+pub mod stream;
 
 #[derive(Debug, Parser)]
 #[command(name = "s1", version, about = "Local gateway for System One models")]
@@ -31,6 +33,8 @@ enum Cmd {
     Raw(raw::RawArgs),
     /// List models, aliases, and their state.
     Models(models::ModelsArgs),
+    /// Ask Decide questions: one text, or one JSON line in, one line out.
+    Decide(decide::DecideArgs),
     /// Manage provider keys in ~/.s1/auth.json.
     Auth {
         #[command(subcommand)]
@@ -47,6 +51,7 @@ pub fn main() -> ExitCode {
         Cmd::Raw(args) => raw::run(args, &paths),
         Cmd::Models(args) => models::run(args, &paths),
         Cmd::Auth { cmd } => auth::run(cmd, &paths),
+        Cmd::Decide(args) => decide::run(args, &paths),
     };
     match result {
         Ok(code) => code,
@@ -96,6 +101,28 @@ mod tests {
             &["s1", "auth", "set", "workers-ai", "--account-id", "x"],
             &["s1", "auth", "list"],
             &["s1", "auth", "token"],
+            &["s1", "decide", "-t", "t.json", "text"],
+            &[
+                "s1",
+                "decide",
+                "-t",
+                "t.json",
+                "--jsonl",
+                "--flat",
+                "--id-field",
+                "key",
+                "--state-field",
+                "body",
+                "--image-field",
+                "photo",
+                "--keep",
+                "*",
+                "--unordered",
+                "-j",
+                "4",
+                "-m",
+                "decide",
+            ],
         ] {
             Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }

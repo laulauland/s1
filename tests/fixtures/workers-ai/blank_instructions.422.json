@@ -1,0 +1,1 @@
+{"errors":[{"message":"AiError: AiError: Request body failed validation: questions.q.noul.instructions: Value error, instructions must not be empty (b1aa0f08-37f6-4b39-b7b4-467371f09e2c)","code":3030}],"success":false,"result":{},"messages":[]}

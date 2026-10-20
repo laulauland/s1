@@ -24,6 +24,9 @@ pub enum S1Error {
     /// No backend can take the request now (503).
     #[error("{0}")]
     BackendUnavailable(String),
+    /// The request body cannot be read (400).
+    #[error("{0}")]
+    InvalidRequest(String),
 }
 
 impl S1Error {
@@ -35,6 +38,7 @@ impl S1Error {
             S1Error::Unsupported(_) => "unsupported",
             S1Error::WrongFamily(_) => "wrong_family",
             S1Error::BackendUnavailable(_) => "backend_unavailable",
+            S1Error::InvalidRequest(_) => "invalid_request",
         }
     }
 
@@ -45,6 +49,7 @@ impl S1Error {
             S1Error::Unsupported(_) => StatusCode::UNPROCESSABLE_ENTITY,
             S1Error::WrongFamily(_) => StatusCode::BAD_REQUEST,
             S1Error::BackendUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            S1Error::InvalidRequest(_) => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -81,6 +86,11 @@ mod tests {
                 S1Error::BackendUnavailable(String::new()),
                 "backend_unavailable",
                 503,
+            ),
+            (
+                S1Error::InvalidRequest(String::new()),
+                "invalid_request",
+                400,
             ),
         ];
         for (err, code, status) in cases {

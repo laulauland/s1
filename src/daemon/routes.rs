@@ -4,13 +4,14 @@
 use axum::Router;
 use axum::routing::get;
 
-use super::{AppState, models, raw};
+use super::{AppState, ingress, models, raw};
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(models::routes())
         .merge(raw::routes())
+        .merge(ingress::routes())
         .with_state(state)
 }
 

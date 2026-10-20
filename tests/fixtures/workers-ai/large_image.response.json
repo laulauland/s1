@@ -1,0 +1,18 @@
+{
+  "result": {
+    "model": "clef-flash",
+    "answers": {
+      "img": {
+        "type": "noul",
+        "noul": 0.0972
+      }
+    },
+    "usage": {
+      "input_tokens": 345,
+      "output_tokens": 0
+    }
+  },
+  "success": true,
+  "errors": [],
+  "messages": []
+}

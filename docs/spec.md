@@ -47,15 +47,18 @@ The forecast ingress exists in v1 so that the format is reserved, but it has no 
 
 **Large inputs**
 
-- Forward the original request bytes. Parse only the fields that routing needs (`model`, input size, images, option counts) with borrowed or `RawValue` parsing.
-- Local clients may send **file paths** for images instead of base64. The daemon reads and encodes the file. Only over the Unix socket.
+- Forward the original request bytes, unchanged except the top-level `model` field: on a typed ingress (`/v1/systemone` and the other family endpoints) s1 replaces it with the resolved upstream id (for Workers AI the short body selector: an upstream of `@cf/cloudflare/clef` gives `clef`). `/v1/raw` changes nothing. Parse only the fields that routing needs (`model`, input size, images, option counts) with borrowed or `RawValue` parsing.
+- Local clients may send **file paths** for images instead of base64. A path-valued systemone asset is `{"type": "image", "s1_path": "/absolute/path.png"}` in `assets`; `s1_path` is not a TypeSafe asset field (`type`, `format`, `data_base64`, `part`), so it cannot be confused with provider input. The daemon reads the file and replaces the asset with `{"type": "image", "format": <png or jpg, from the bytes>, "data_base64": ...}` before routing, so routing and the cache key see the image content, never the path. Only those assets are rebuilt; every other member keeps its exact bytes. A key spelled with JSON escapes (for example `"s1\u005fpath"`) counts as `s1_path`.
+  - Only on the Unix socket of the typed `/v1/systemone` ingress. On TCP the request fails with `invalid_request` (400) and s1 never reads the file. `/v1/raw` sends `s1_path` to the provider as is.
+  - The path must be absolute (`s1 decide --image-field` makes relative paths absolute). A missing or unreadable file, or a file that is not PNG or JPEG, is `invalid_request`. A file over 16 MiB (TypeSafe's per-image limit), or an expanded body over the daemon's body limit, is `too_long` (413).
+  - `s1 decide --image-field` sends paths this way, so the CLI and other local clients share one code path.
 - Reuse connections to providers (HTTP/2 where the provider supports it, else keep-alive pools).
 
 **Crates:** `tokio`, `axum`, `hyper`, `reqwest`, `serde_json`, `tokenizers`, `governor`, `clap`, `blake3`, `tracing`, `proptest`. MCP: `rmcp` if it supports the 2026-07-28 stateless transport, else a small hand-written handler.
 
 ## API families and wire formats
 
-The endpoint selects the family. The `model` field selects the backend. Request and response bodies are the providers' own formats, unchanged.
+The endpoint selects the family. The `model` field selects the backend. Request and response bodies are the providers' own formats, unchanged, except the top-level `model` field of a request: s1 replaces it with the resolved upstream id (for example `decide` becomes `clef-flash`). Typed ingresses may also expand local image paths (see "Large inputs") and fix provider quirks in responses (see "Backend quirks"). `/v1/raw/{protocol}` is pure passthrough: request and response (status and body) unchanged.
 
 | Endpoint on s1 | Family | Format source | Translated? |
 | --- | --- | --- | --- |
@@ -130,7 +133,7 @@ spill = false                 # use later entries only when the first is unavail
 **Routing rules**
 
 - The endpoint fixes the family. A model from another family is an error (`wrong_family`).
-- An ID resolves to one backend. An alias resolves to an ordered list. The router takes the first entry that is available and whose capabilities fit the request (context, images, option count).
+- An ID resolves to one backend. An alias resolves to an ordered list. The router takes the first entry that is available and whose capabilities fit the request (context, images, option count). The context fit counts text bytes as tokens and each image as at most 1,027 tokens (Clef: up to 1,024 plus 3 marker tokens), never its base64 bytes.
 - Spill to the next entry when the first is throttled happens only if the alias sets `spill = true`.
 - Every response records the backend and the resolved model in a response header (`s1-backend`, `s1-model`). The body is not changed.
 
@@ -163,12 +166,17 @@ trait Backend: Send + Sync {
     fn protocols(&self) -> &[ProtocolId];            // formats it accepts natively
     fn caps(&self, model: &str) -> Option<&Model>;   // from the catalog; None if unknown
     async fn call(&self, req: BackendRequest) -> Result<ProviderResponse>;
+    /// Typed ingress only (never /v1/raw): fix response quirks, e.g. 403 -> 401,
+    /// remove the Workers AI envelope, map provider overflow errors to too_long.
+    fn typed_response(&self, upstream_model: &str, resp: ProviderResponse)
+        -> Result<ProviderResponse> { Ok(resp) }
 }
 
 /// What a backend sends upstream.
 struct BackendRequest {
     upstream_model: String,  // catalog `upstream` id
-    body: Bytes,             // original request bytes, unchanged
+    body: Bytes,             // request bytes: unchanged on /v1/raw; on a typed
+                             // ingress only `model` is set to the upstream id
     headers: HeaderMap,      // client headers the provider must see (content type,
                              // opt-in headers such as TypeSafe-Danger-Zone-Images);
                              // never the client's Authorization
@@ -185,8 +193,8 @@ trait Translate {
 
 | Backend | Protocols | Quirks |
 | --- | --- | --- |
-| TypeSafe Jev | systemone | Image header; long-context header; missing key returns 403, not 401 |
-| Workers AI Clef | systemone | Model in the URL path and in the body; Workers AI envelope around the response; silent truncation of long input |
+| TypeSafe Jev | systemone | Image header; long-context header (s1 adds it when the request is over 64k tokens or one question, that is the state plus that question, is over 32k); missing key returns 403, not 401 (the typed `/v1/systemone` ingress turns it into a clear 401 with `s1-upstream-status: 403`; `/v1/raw` returns the 403 unchanged) |
+| Workers AI Clef | systemone | Model in the URL path and in the body (must match); Workers AI envelope around the response; docs say long input is silently truncated, but live calls get an explicit error (mapped to `too_long`); no `assets` (takes an `images` array); 1 to 64 questions, at least 2 options and 2 levels; every question needs non-blank `instructions`; question names `[A-Za-z0-9_.-]`, 1 to 100 characters (alias routing skips Clef when these do not fit) |
 | Workers AI Clairic | clairic | Same URL and envelope as Clef; preview format |
 | OpenAI Decisions | openai-decisions | Public beta; refusals per question |
 
@@ -404,7 +412,7 @@ Each milestone ends with something usable from the shell.
 ## Open questions
 
 - Does `rmcp` support the 2026-07-28 stateless transport, and can a stateless call stream progress?
-- Is Clef fully systemone-compatible in practice (limits, error shapes, truncation)? Verify with real calls in milestone 2.
+- ~~Is Clef fully systemone-compatible in practice (limits, error shapes, truncation)?~~ Answered in milestone 2 (live calls, 2026-10-20): answers and usage have the systemone shape; requests differ (no `box`, no `assets`, unknown fields rejected, 1 to 64 questions, at least 2 options and 2 levels, non-blank `instructions` required, question names `[A-Za-z0-9_.-]{1,100}`). Errors use the Workers AI envelope. Over-context input is rejected (413 code 5021 when `bytes / 4` exceeds the context, image data not counted; 422 code 3030 "Request requires N tokens"), not silently truncated. Fixtures: `tests/fixtures/workers-ai/`.
 - Real rate limits for each provider account, to replace the placeholder numbers.
 - Item cap for MCP list calls (1,000 is a guess). Measure against client timeouts.
 - Which forecast backend comes first: a hosted TSFM provider or a local worker?

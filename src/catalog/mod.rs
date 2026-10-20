@@ -56,10 +56,42 @@ pub struct Model {
     pub max_options: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_levels: Option<u32>,
+    /// Fewest choice options the model accepts (Clef: 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_options: Option<u32>,
+    /// Fewest score levels the model accepts (Clef: 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_levels: Option<u32>,
+    /// Most questions in one request (Clef: 64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_questions: Option<u32>,
+    /// Context one question may use without the long-context opt-in (Jev:
+    /// 32,768; the long context covers questions too).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_context_tokens: Option<u64>,
+    /// Context with the provider's long-context opt-in (Jev: 262,144 with
+    /// `TypeSafe-Danger-Zone-Long-Context: true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_context_tokens: Option<u64>,
     #[serde(default)]
     pub images: Images,
     #[serde(default)]
     pub compat: BTreeMap<String, Value>,
+}
+
+impl Model {
+    /// A boolean `compat` flag, or `default` when unset.
+    pub fn compat_flag(&self, key: &str, default: bool) -> bool {
+        self.compat
+            .get(key)
+            .and_then(Value::as_bool)
+            .unwrap_or(default)
+    }
+
+    /// Id sent to the provider.
+    pub fn upstream_id(&self) -> &str {
+        self.upstream.as_deref().unwrap_or(&self.id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -112,7 +144,7 @@ impl ModelRef<'_> {
         self.api().family()
     }
     pub fn upstream(&self) -> &str {
-        self.model.upstream.as_deref().unwrap_or(&self.model.id)
+        self.model.upstream_id()
     }
     pub fn auth_entry(&self) -> &str {
         self.provider.auth.as_deref().unwrap_or(self.provider_name)
@@ -263,6 +295,10 @@ impl Catalog {
                         "context_tokens": m.model.context_tokens,
                         "max_options": m.model.max_options,
                         "max_levels": m.model.max_levels,
+                        "min_options": m.model.min_options,
+                        "min_levels": m.model.min_levels,
+                        "max_questions": m.model.max_questions,
+                        "long_context_tokens": m.model.long_context_tokens,
                         "images": m.model.images,
                     },
                     "compat": m.model.compat,

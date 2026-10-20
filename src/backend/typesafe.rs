@@ -1,16 +1,27 @@
 //! TypeSafe Jev: `POST {base_url}/v1/systemone` with a bearer key.
 //!
-//! Quirks: images need `TypeSafe-Danger-Zone-Images: true`, long context needs
-//! `TypeSafe-Danger-Zone-Long-Context: true` (both passed through from the
-//! client); a missing key returns 403, not 401.
+//! Quirks:
+//! - Images (`assets`) and `box` questions need `TypeSafe-Danger-Zone-Images: true`.
+//!   Long context needs `TypeSafe-Danger-Zone-Long-Context: true`. Client
+//!   headers pass through; s1 adds them when the request needs them
+//!   ([`opt_in_headers`]).
+//! - A missing key returns 403, not 401. On the typed `/v1/systemone`
+//!   ingress s1 turns that 403 into 401 with a message that names
+//!   `s1 auth set` ([`map_missing_key`]). `/v1/raw` returns the 403 unchanged.
 
 use async_trait::async_trait;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use bytes::Bytes;
 
 use super::{Backend, BackendContext, BackendRequest, ProviderResponse, copy_headers};
-use crate::catalog::{Model, Provider};
+use crate::catalog::{Images, Model, Provider};
 use crate::error::S1Error;
-use crate::protocol::ProtocolId;
+use crate::protocol::{Protocol, ProtocolId, RouteInfo, systemone::Systemone};
+
+pub const IMAGES_HEADER: &str = "typesafe-danger-zone-images";
+pub const LONG_CONTEXT_HEADER: &str = crate::router::LONG_CONTEXT_HEADER;
+/// Set on a response whose status s1 changed; holds the provider's status.
+pub const UPSTREAM_STATUS_HEADER: &str = "s1-upstream-status";
 
 pub struct TypeSafe {
     name: String,
@@ -49,6 +60,70 @@ pub fn forward_response_header(name: &str) -> bool {
         || name.starts_with("x-ratelimit-")
 }
 
+/// Opt-in headers the request needs and the client did not send.
+pub fn opt_in_headers(model: Option<&Model>, info: &RouteInfo, sent: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    let yes = HeaderValue::from_static("true");
+    let needs_images = info.assets > 0 || info.has_box;
+    let preview = model.is_none_or(|m| m.images == Images::Preview);
+    if needs_images && preview && !sent.contains_key(IMAGES_HEADER) {
+        out.insert(HeaderName::from_static(IMAGES_HEADER), yes.clone());
+    }
+    // Jev limits the request (64k) and each question (32k: the state plus
+    // that question); the opt-in raises both.
+    let needs_long = |m: &Model| {
+        m.context_tokens.is_some_and(|ctx| info.tokens_high() > ctx)
+            || m.question_context_tokens
+                .is_some_and(|ctx| info.question_tokens_high() > ctx)
+    };
+    if let Some(m) = model
+        && m.long_context_tokens.is_some()
+        && needs_long(m)
+        && !sent.contains_key(LONG_CONTEXT_HEADER)
+    {
+        out.insert(HeaderName::from_static(LONG_CONTEXT_HEADER), yes);
+    }
+    out
+}
+
+/// TypeSafe answers 403 (not 401) when no key arrives. Make it a clear 401.
+pub fn map_missing_key(resp: ProviderResponse, auth_entry: &str) -> ProviderResponse {
+    if resp.status != StatusCode::FORBIDDEN {
+        return resp;
+    }
+    let detail: Option<serde_json::Value> = serde_json::from_slice(&resp.body).ok();
+    let detail = detail.as_ref().and_then(|v| v.get("detail"));
+    if detail
+        .and_then(|d| d.get("error_type"))
+        .and_then(|t| t.as_str())
+        != Some("authentication_error")
+    {
+        return resp;
+    }
+    let upstream = detail
+        .and_then(|d| d.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+    let body = serde_json::json!({
+        "detail": {
+            "error_type": "authentication_error",
+            "message": format!(
+                "TypeSafe got no API key (HTTP 403: {upstream}). Set one with `s1 auth set {auth_entry}` or TYPESAFE_API_KEY."
+            ),
+        }
+    });
+    let mut headers = resp.headers;
+    headers.insert(
+        HeaderName::from_static(UPSTREAM_STATUS_HEADER),
+        HeaderValue::from_static("403"),
+    );
+    ProviderResponse {
+        status: StatusCode::UNAUTHORIZED,
+        headers,
+        body: Bytes::from(body.to_string()),
+    }
+}
+
 #[async_trait]
 impl Backend for TypeSafe {
     fn name(&self) -> &str {
@@ -68,6 +143,14 @@ impl Backend for TypeSafe {
         let key = self.ctx.key(&self.name, auth_entry)?;
         let mut headers = HeaderMap::new();
         copy_headers(&req.headers, &mut headers, forward_request_header);
+        if let Ok(info) = Systemone.inspect(&req.body) {
+            let model = self
+                .provider
+                .models
+                .iter()
+                .find(|m| m.upstream_id() == req.upstream_model);
+            headers.extend(opt_in_headers(model, &info, &headers));
+        }
         if !headers.contains_key(header::CONTENT_TYPE) {
             headers.insert(
                 header::CONTENT_TYPE,
@@ -106,5 +189,138 @@ impl Backend for TypeSafe {
             headers: out_headers,
             body,
         })
+    }
+
+    fn typed_response(
+        &self,
+        _upstream_model: &str,
+        resp: ProviderResponse,
+    ) -> Result<ProviderResponse, S1Error> {
+        Ok(map_missing_key(
+            resp,
+            self.provider.auth.as_deref().unwrap_or(&self.name),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::Catalog;
+
+    fn jev() -> Model {
+        Catalog::builtin()
+            .model("typesafe/jev-latest")
+            .unwrap()
+            .model
+            .clone()
+    }
+
+    #[test]
+    fn images_header_added_for_assets_and_box() {
+        let m = jev();
+        let none = HeaderMap::new();
+        let plain = RouteInfo {
+            input_bytes: 100,
+            ..Default::default()
+        };
+        assert!(opt_in_headers(Some(&m), &plain, &none).is_empty());
+        let assets = RouteInfo {
+            assets: 1,
+            ..plain.clone()
+        };
+        assert_eq!(
+            opt_in_headers(Some(&m), &assets, &none)[IMAGES_HEADER],
+            "true"
+        );
+        let boxq = RouteInfo {
+            has_box: true,
+            ..plain.clone()
+        };
+        assert_eq!(
+            opt_in_headers(Some(&m), &boxq, &none)[IMAGES_HEADER],
+            "true"
+        );
+        // Not twice.
+        let mut sent = HeaderMap::new();
+        sent.insert(IMAGES_HEADER, HeaderValue::from_static("true"));
+        assert!(opt_in_headers(Some(&m), &assets, &sent).is_empty());
+    }
+
+    #[test]
+    fn long_context_header_added_when_input_needs_it() {
+        let m = jev();
+        let short = RouteInfo {
+            input_bytes: 90_000,
+            ..Default::default()
+        };
+        assert!(opt_in_headers(Some(&m), &short, &HeaderMap::new()).is_empty());
+        let long = RouteInfo {
+            input_bytes: 300_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            opt_in_headers(Some(&m), &long, &HeaderMap::new())[LONG_CONTEXT_HEADER],
+            "true"
+        );
+    }
+
+    #[test]
+    fn long_context_header_added_when_one_question_needs_it() {
+        let m = jev();
+        // About 40k tokens: under the 65,536 request limit, but state plus
+        // one question is over Jev's 32k per-question limit.
+        let big_state = RouteInfo {
+            input_bytes: 120_000,
+            questions: 2,
+            questions_bytes: 200,
+            max_question_bytes: 100,
+            ..Default::default()
+        };
+        assert_eq!(
+            opt_in_headers(Some(&m), &big_state, &HeaderMap::new())[LONG_CONTEXT_HEADER],
+            "true"
+        );
+        // Same size, but spread over many small questions: each question
+        // sees only the state and itself.
+        let many_questions = RouteInfo {
+            input_bytes: 120_000,
+            questions: 1_000,
+            questions_bytes: 110_000,
+            max_question_bytes: 110,
+            ..Default::default()
+        };
+        assert!(opt_in_headers(Some(&m), &many_questions, &HeaderMap::new()).is_empty());
+    }
+
+    #[test]
+    fn missing_key_403_becomes_clear_401() {
+        let body = br#"{"detail":{"error_type":"authentication_error","message":"Must supply an API key! Check your request and try again."}}"#;
+        let resp = map_missing_key(
+            ProviderResponse {
+                status: StatusCode::FORBIDDEN,
+                headers: HeaderMap::new(),
+                body: Bytes::from_static(body),
+            },
+            "typesafe",
+        );
+        assert_eq!(resp.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.headers[UPSTREAM_STATUS_HEADER], "403");
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["detail"]["error_type"], "authentication_error");
+        let msg = v["detail"]["message"].as_str().unwrap();
+        assert!(msg.contains("s1 auth set typesafe"), "{msg}");
+        assert!(msg.contains("403"), "{msg}");
+
+        // Other 403s and other statuses pass through.
+        let other = map_missing_key(
+            ProviderResponse {
+                status: StatusCode::FORBIDDEN,
+                headers: HeaderMap::new(),
+                body: Bytes::from_static(br#"{"detail":{"error_type":"permission_error"}}"#),
+            },
+            "typesafe",
+        );
+        assert_eq!(other.status, StatusCode::FORBIDDEN);
     }
 }

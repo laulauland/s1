@@ -82,8 +82,11 @@ async fn raw(
         return error_response(proto, &err, &rid, Some(&provider));
     }
 
-    // Read the model for the header only; the body is sent as is.
-    let sent_model = proto.and_then(|p| p.inspect(&body).ok()).map(|i| i.model);
+    // Read the model for the header and the provider path only; the body
+    // is sent as is. Only the top-level `model` is read, so a member the
+    // typed protocol cannot read (left for the provider to judge) does not
+    // change where the request goes.
+    let sent_model = proto.and_then(|_| protocol::top_level_model(&body));
     let (s1_model, upstream) = match sent_model.as_deref() {
         Some(m) => match st.catalog.provider_model(&provider, m) {
             Some(r) => (Some(r.id()), r.upstream().to_string()),
@@ -145,13 +148,13 @@ async fn raw(
     }
 }
 
-fn set(h: &mut HeaderMap, name: &'static str, value: &str) {
+pub(super) fn set(h: &mut HeaderMap, name: &'static str, value: &str) {
     if let Ok(v) = HeaderValue::from_str(value) {
         h.insert(HeaderName::from_static(name), v);
     }
 }
 
-fn error_response(
+pub(super) fn error_response(
     proto: Option<&dyn protocol::Protocol>,
     err: &S1Error,
     rid: &str,
