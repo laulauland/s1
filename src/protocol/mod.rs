@@ -13,6 +13,7 @@ use crate::error::S1Error;
 pub mod clairic;
 pub mod openai_decisions;
 pub mod systemone;
+pub mod tsfm;
 
 /// Model family. The endpoint fixes the family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -216,7 +217,7 @@ pub fn by_id(id: ProtocolId) -> Option<&'static dyn Protocol> {
         ProtocolId::Systemone => Some(&systemone::Systemone),
         ProtocolId::OpenaiDecisions => Some(&openai_decisions::OpenaiDecisions),
         ProtocolId::Clairic => Some(&clairic::Clairic),
-        _ => None,
+        ProtocolId::Tsfm => Some(&tsfm::Tsfm),
     }
 }
 

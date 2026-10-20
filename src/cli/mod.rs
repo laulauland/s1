@@ -13,6 +13,7 @@ pub mod client;
 mod daemon;
 pub mod decide;
 pub mod extract;
+pub mod forecast;
 mod models;
 mod raw;
 mod status;
@@ -40,6 +41,8 @@ enum Cmd {
     Decide(decide::DecideArgs),
     /// Extract typed values: one text or document, or one JSON line in, one line out.
     Extract(extract::ExtractArgs),
+    /// Forecast numeric series: a TSFM request, or a long-format CSV.
+    Forecast(forecast::ForecastArgs),
     /// Queues, limits, and breakers per backend; cache size.
     Status(status::StatusArgs),
     /// Manage the response cache.
@@ -65,6 +68,7 @@ pub fn main() -> ExitCode {
         Cmd::Auth { cmd } => auth::run(cmd, &paths),
         Cmd::Decide(args) => decide::run(args, &paths),
         Cmd::Extract(args) => extract::run(args, &paths),
+        Cmd::Forecast(args) => forecast::run(args, &paths),
         Cmd::Status(args) => status::run(args, &paths),
         Cmd::Cache { cmd } => cache::run(cmd, &paths),
     };
@@ -122,6 +126,32 @@ mod tests {
             &["s1", "decide", "-t", "t.json", "--no-cache", "text"],
             &["s1", "decide", "-t", "t.json", "text"],
             &["s1", "decide", "--openai", "-t", "t.json", "text"],
+            &[
+                "s1",
+                "forecast",
+                "-m",
+                "tsfm/chronos",
+                "--csv",
+                "sales.csv",
+                "--id",
+                "sku",
+                "--time",
+                "ds",
+                "--value",
+                "y",
+                "-h",
+                "28",
+            ],
+            &[
+                "s1",
+                "forecast",
+                "--flat",
+                "-q",
+                "0.1,0.5,0.9",
+                "--freq",
+                "D",
+                "--print-request",
+            ],
             &[
                 "s1",
                 "decide",

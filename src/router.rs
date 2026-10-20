@@ -84,6 +84,14 @@ impl Router<'_> {
         info: &RouteInfo,
         flags: RequestFlags,
     ) -> Result<Route, S1Error> {
+        // A family with no model at all (forecast in v1) has no backend.
+        let family = ingress.family();
+        if !self.catalog.models().any(|m| m.family() == family) {
+            return Err(S1Error::BackendUnavailable(format!(
+                "no {0} backend is configured; add a `{ingress}` provider to models.toml",
+                family.as_str()
+            )));
+        }
         if let Some(entries) = self.expand_alias(&info.model)? {
             return self.pick(ingress, &info.model, &entries, info, flags);
         }
@@ -452,6 +460,43 @@ mod tests {
 
     fn route(c: &Catalog, info: &RouteInfo) -> Result<String, S1Error> {
         route_with(c, info, &|_| true).map(|r| r.model_id)
+    }
+
+    fn route_forecast(c: &Catalog, model: &str) -> Result<Route, S1Error> {
+        let reg = registry(c);
+        Router {
+            catalog: c,
+            backends: &reg,
+            available: &|_| Ok(()),
+            throttled: &|_| false,
+        }
+        .route(ProtocolId::Tsfm, &info(model), RequestFlags::default())
+    }
+
+    #[test]
+    fn forecast_without_a_backend_is_unavailable() {
+        let c = Catalog::builtin();
+        for model in [
+            "forecast",
+            "amazon/chronos-bolt-small",
+            "typesafe/jev-latest",
+        ] {
+            let e = route_forecast(&c, model).unwrap_err();
+            assert_eq!(e.code(), "backend_unavailable", "{model}: {e}");
+            assert_eq!(e.status().as_u16(), 503);
+        }
+        // A tsfm provider in the overlay makes the family routable.
+        let c = Catalog::with_overlay_str(
+            "[providers.tsfm]\nbase_url = \"http://127.0.0.1:9\"\napi = \"tsfm\"\n\
+             [[providers.tsfm.models]]\nid = \"chronos\"\nupstream = \"amazon/chronos-bolt-small\"\n\
+             [aliases.forecast]\nmodels = [\"tsfm/chronos\"]\n",
+        )
+        .unwrap();
+        let r = route_forecast(&c, "forecast").unwrap();
+        assert_eq!(r.model_id, "tsfm/chronos");
+        assert_eq!(r.upstream, "amazon/chronos-bolt-small");
+        let e = route_forecast(&c, "typesafe/jev-latest").unwrap_err();
+        assert_eq!(e.code(), "wrong_family");
     }
 
     #[test]

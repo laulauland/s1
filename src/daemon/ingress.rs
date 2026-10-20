@@ -20,7 +20,8 @@
 //! in the client's format. The cache keeps the client-format answer.
 //!
 //! One handler serves every wire format; each endpoint is one line in
-//! [`routes`] (`/v1/systemone`, `/v1/decisions`, `/v1/extract`).
+//! [`routes`] (`/v1/systemone`, `/v1/decisions`, `/v1/extract`,
+//! `/v1/forecast`).
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -70,6 +71,14 @@ pub fn routes() -> Router<AppState> {
             post(
                 |st: State<AppState>, o: Option<Extension<Origin>>, h: HeaderMap, b: Body| {
                     handle(st, ProtocolId::Clairic, origin(o), h, b)
+                },
+            ),
+        )
+        .route(
+            "/v1/forecast",
+            post(
+                |st: State<AppState>, o: Option<Extension<Origin>>, h: HeaderMap, b: Body| {
+                    handle(st, ProtocolId::Tsfm, origin(o), h, b)
                 },
             ),
         )

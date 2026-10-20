@@ -185,7 +185,7 @@ async fn tools_list_is_static_cacheable_and_has_output_schemas() {
     assert!(a["_meta"]["s1/catalogVersion"].is_string());
     let tools = a["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["decide", "extract", "models"]);
+    assert_eq!(names, ["decide", "extract", "forecast", "models"]);
     for t in tools {
         assert!(t["outputSchema"].is_object(), "{t}");
         assert_eq!(t["inputSchema"]["type"], "object");
@@ -523,7 +523,7 @@ async fn tcp_needs_the_bearer_token() {
     let ok = send(Some(&h.token)).await.unwrap();
     assert_eq!(ok.status(), 200);
     let v: Value = serde_json::from_slice(&ok.bytes().await.unwrap()).unwrap();
-    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 4);
     h.server.shutdown().await;
 }
 

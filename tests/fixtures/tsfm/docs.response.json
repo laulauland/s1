@@ -1,0 +1,38 @@
+{
+  "id": "8de64ea3-1d1e-4e72-87f0-0ac4a0c2693b",
+  "object": "forecast",
+  "created": 1773369600,
+  "model": "amazon/chronos-bolt-small",
+  "provider": "harpoon",
+  "horizon": 7,
+  "prediction_length": 7,
+  "quantile_levels": [0.1, 0.5, 0.9],
+  "input_points": 10,
+  "outputs": [{
+    "mean": [[478.1], [482.6], [487.4], [491.8], [495.2], [499.3], [503.0]],
+    "quantile_predictions": [
+      { "level": 0.1, "values": [[470.9], [474.1], [478.0], [481.8], [484.6], [488.1], [491.4]] },
+      { "level": 0.5, "values": [[478.1], [482.6], [487.4], [491.8], [495.2], [499.3], [503.0]] },
+      { "level": 0.9, "values": [[485.5], [491.3], [496.1], [501.0], [505.7], [510.8], [515.2]] }
+    ],
+    "timestamps": [
+      "2026-02-11T00:00:00Z",
+      "2026-02-12T00:00:00Z",
+      "2026-02-13T00:00:00Z",
+      "2026-02-14T00:00:00Z",
+      "2026-02-15T00:00:00Z",
+      "2026-02-16T00:00:00Z",
+      "2026-02-17T00:00:00Z"
+    ],
+    "metadata": { "item_id": "store_017" }
+  }],
+  "usage": {
+    "input_tokens": 128,
+    "output_tokens": 21,
+    "total_tokens": 149
+  },
+  "latency_ms": 38.4,
+  "metadata": {
+    "surface": "docs.quickstart"
+  }
+}

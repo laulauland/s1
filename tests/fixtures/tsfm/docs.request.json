@@ -1,0 +1,16 @@
+{
+  "model": "amazon/chronos-bolt-small",
+  "inputs": [{
+    "start": "2026-02-01T00:00:00Z",
+    "target": [[428], [435], [441], [438], [446], [452], [460], [458], [466], [472]],
+    "metadata": { "item_id": "store_017" }
+  }],
+  "parameters": {
+    "prediction_length": 7,
+    "frequency": "D",
+    "quantile_levels": [0.1, 0.5, 0.9]
+  },
+  "metadata": {
+    "surface": "docs.quickstart"
+  }
+}

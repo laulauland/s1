@@ -54,6 +54,11 @@ fn unauthorized_body(path: &str) -> serde_json::Value {
             "errors": [{"code": CODE, "message": MESSAGE}],
             "messages": []
         }),
+        crate::protocol::tsfm::ENDPOINT => serde_json::json!({
+            "error": MESSAGE,
+            "code": CODE,
+            "endpoint": crate::protocol::tsfm::ENDPOINT
+        }),
         _ => serde_json::json!({"error": {"code": CODE, "message": MESSAGE}}),
     }
 }

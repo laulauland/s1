@@ -547,7 +547,19 @@ async fn tcp_401_uses_each_typed_ingress_error_format() {
     assert_eq!(r.status().as_u16(), 401);
     check_extract(serde_json::from_slice(&r.bytes().await.unwrap()).unwrap());
 
-    // Other endpoints keep the generic envelope.
+    // /v1/forecast: the TSFM error body.
+    let r = post("/v1/forecast").await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    assert_eq!(r.headers()["www-authenticate"], "Bearer");
+    let v: Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(v["code"], "unauthorized", "{v}");
+    assert_eq!(v["endpoint"], "/v1/forecast", "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("s1 auth token"),
+        "{v}"
+    );
+
+    // Endpoints without a typed ingress keep the generic envelope.
     let r = post("/v1/raw/systemone").await.unwrap();
     let v: Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
     assert_eq!(v["error"]["code"], "unauthorized", "{v}");

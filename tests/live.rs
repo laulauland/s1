@@ -550,3 +550,61 @@ async fn live_mcp_decide_and_extract_lists() {
         eprintln!("{name}: {}", v["result"]["structuredContent"]);
     }
 }
+
+/// TSFM.ai forecast through a `tsfm` provider from the overlay. Needs a
+/// `tsfm` key (`TSFM_API_KEY` or `~/.s1/auth.json`); there is none in v1,
+/// so this normally skips.
+#[tokio::test]
+#[ignore = "live: needs S1_LIVE=1 and a TSFM.ai key"]
+async fn live_forecast_tsfm_tiny_request() {
+    if std::env::var("S1_LIVE").as_deref() != Ok("1") {
+        eprintln!("skip: S1_LIVE is not 1");
+        return;
+    }
+    let real = KeyResolver::from_process(&Paths::from_env());
+    let Ok(Some(k)) = real.resolve("tsfm") else {
+        eprintln!("skip: no key for tsfm (TSFM_API_KEY or auth.json entry `tsfm`)");
+        return;
+    };
+    let key = k.key.expose().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    let keys = KeyResolver::new(paths.auth_file(), move |name| {
+        (name == "TSFM_API_KEY").then(|| key.clone())
+    });
+    let token = keys.ensure_local_token().unwrap();
+    let catalog = Catalog::with_overlay_str(
+        "[providers.tsfm]\nbase_url = \"https://api.tsfm.ai\"\napi = \"tsfm\"\n\
+         [[providers.tsfm.models]]\nid = \"chronos-bolt-small\"\nupstream = \"amazon/chronos-bolt-small\"\n",
+    )
+    .unwrap();
+    let _server = serve(ServerOptions {
+        socket: paths.socket.clone(),
+        tcp: "127.0.0.1:0".parse().unwrap(),
+        state: AppState::new(catalog, keys),
+        token,
+    })
+    .await
+    .unwrap();
+    let body = br#"{"model":"tsfm/chronos-bolt-small","inputs":[{"start":"2026-02-01T00:00:00Z","target":[[428],[435],[441],[438],[446],[452],[460],[458],[466],[472]],"metadata":{"id":"store_017"}}],"parameters":{"prediction_length":3,"frequency":"D","quantile_levels":[0.1,0.5,0.9]}}"#;
+    let mut h = HeaderMap::new();
+    h.insert("content-type", HeaderValue::from_static("application/json"));
+    let reply = request(
+        &paths.socket,
+        Method::POST,
+        "/v1/forecast",
+        h,
+        Bytes::from_static(body),
+    )
+    .await
+    .unwrap();
+    assert!(
+        reply.status.is_success(),
+        "{}: {}",
+        reply.status,
+        String::from_utf8_lossy(&reply.body)
+    );
+    record("tsfm/live.response.json", &reply.body);
+    let rows = s1::protocol::tsfm::flatten_rows(&reply.body).unwrap();
+    assert_eq!(rows.len(), 3);
+}

@@ -15,6 +15,7 @@ use crate::protocol::ProtocolId;
 use crate::secrets::{ApiKey, KeyResolver};
 
 pub mod openai;
+pub mod tsfm;
 pub mod typesafe;
 pub mod workers_ai;
 
@@ -137,6 +138,12 @@ pub fn build(name: &str, provider: &Provider, ctx: &BackendContext) -> Option<Ar
             ctx.clone(),
         ))),
         (_, ProtocolId::OpenaiDecisions) => Some(Arc::new(openai::OpenAi::new(
+            name,
+            provider.clone(),
+            ctx.clone(),
+        ))),
+        // Only from models.toml: the compiled-in catalog has no forecast provider.
+        (_, ProtocolId::Tsfm) => Some(Arc::new(tsfm::Tsfm::new(
             name,
             provider.clone(),
             ctx.clone(),

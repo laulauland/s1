@@ -36,6 +36,7 @@ use crate::images::Origin;
 
 pub mod decide;
 pub mod extract;
+pub mod forecast;
 pub mod jsonrpc;
 pub mod list;
 pub mod models;

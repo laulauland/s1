@@ -1,13 +1,13 @@
 //! MCP tools: the [`Tool`] trait and the one registration list ([`all`]).
 //!
 //! A new tool is a new module with a `Tool` value plus one line in [`all`]
-//! (stage 7 adds `forecast` this way).
+//! (`forecast` was added this way in stage 7).
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use super::{decide, extract, models};
+use super::{decide, extract, forecast, models};
 use crate::catalog::Catalog;
 use crate::daemon::AppState;
 use crate::images::Origin;
@@ -89,7 +89,12 @@ pub trait Tool: Send + Sync {
 }
 
 /// Every tool, in `tools/list` order.
-static ALL: [&dyn Tool; 3] = [&decide::TOOL, &extract::TOOL, &models::Models];
+static ALL: [&dyn Tool; 4] = [
+    &decide::TOOL,
+    &extract::TOOL,
+    &forecast::Forecast,
+    &models::Models,
+];
 
 pub fn all() -> &'static [&'static dyn Tool] {
     &ALL
@@ -155,7 +160,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["decide", "extract", "models"]);
+        assert_eq!(names, ["decide", "extract", "forecast", "models"]);
         for t in list["tools"].as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object", "{t}");
             assert!(t["outputSchema"].is_object(), "{t}");
