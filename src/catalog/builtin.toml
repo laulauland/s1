@@ -1,0 +1,77 @@
+# Compiled-in catalog for the four v1 backends.
+# Users add or override any field in ~/.config/s1/models.toml.
+# Model IDs are `provider/model`. Sources: /docs/spec.md and provider docs
+# (TypeSafe models page, Workers AI Clef/Clairic pages, OpenAI gpt-6-luna page).
+
+[providers.typesafe]
+base_url = "https://api.typesafe.ai"
+api = "systemone"
+auth = "typesafe"
+
+[[providers.typesafe.models]]
+id = "jev-latest"
+upstream = "jev-latest"
+context_tokens = 65536
+max_options = 255
+max_levels = 10
+images = "preview"
+compat = { noul_confidence = false, box = false }
+
+[[providers.typesafe.models]]
+id = "jev-preview"
+upstream = "jev-preview"
+context_tokens = 65536
+max_options = 255
+max_levels = 10
+images = "preview"
+compat = { noul_confidence = false, box = true }
+
+[providers.workers-ai]
+base_url = "https://api.cloudflare.com/client/v4"
+api = "systemone"
+auth = "workers-ai"
+
+[[providers.workers-ai.models]]
+id = "clef"
+upstream = "clef"
+context_tokens = 65536
+max_options = 255
+max_levels = 10
+images = "yes"
+compat = { noul_confidence = false, silent_truncation = true }
+
+[[providers.workers-ai.models]]
+id = "clef-flash"
+upstream = "clef-flash"
+context_tokens = 24576
+max_options = 255
+max_levels = 10
+images = "yes"
+compat = { noul_confidence = false, silent_truncation = true }
+
+[[providers.workers-ai.models]]
+id = "clairic"
+api = "clairic"
+upstream = "clairic"
+context_tokens = 65536
+images = "yes"
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api = "openai-decisions"
+auth = "openai"
+
+[[providers.openai.models]]
+id = "gpt-6-luna"
+upstream = "gpt-6-luna"
+context_tokens = 922000
+max_options = 255
+images = "yes"
+
+[aliases.decide]
+models = ["workers-ai/clef-flash", "typesafe/jev-latest"]
+spill = false
+
+[aliases.extract]
+models = ["workers-ai/clairic"]
+spill = false
