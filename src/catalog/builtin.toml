@@ -69,6 +69,10 @@ api = "clairic"
 upstream = "clairic"
 context_tokens = 65536
 images = "yes"
+# Clairic takes an `images` array (max 4, checked by the clairic protocol).
+# Long state is cut to fit and flagged `truncated: true`; Workers AI refuses
+# only when `bytes / 4` exceeds twice the context (live, 2026-10-20).
+compat = { images_array = true, truncates = true, max_request_tokens = 131072 }
 
 [providers.openai]
 base_url = "https://api.openai.com/v1"

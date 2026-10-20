@@ -1,0 +1,1 @@
+{"errors":[{"message":"AiError: AiError: Request body failed validation: images.0: image must be an embedded base64 data URI (aa4f1150-39cc-499e-82c3-bed613a43367)","code":3030}],"success":false,"result":{},"messages":[]}

@@ -305,16 +305,33 @@ pub fn fits(
             crate::translate::decide::MAX_OPENAI_IMAGES
         )));
     }
-    let tokens = match est {
-        Estimate::High => info.tokens_high(),
-        Estimate::Low => info.tokens_low(),
-    };
-    if let Some(ctx) = effective_context(model, tokens, flags)
-        && tokens > ctx
-    {
-        return Err(S1Error::TooLong(format!(
-            "request is about {tokens} tokens; `{id}` takes {ctx}"
-        )));
+    if model.compat_flag("truncates", false) {
+        // The provider cuts long input to fit and says so in the response
+        // (Clairic `truncated: true`); only its own size pre-check refuses.
+        let tokens = info.tokens_low();
+        if let Some(max) = model
+            .compat
+            .get("max_request_tokens")
+            .and_then(toml::Value::as_integer)
+            .and_then(|v| u64::try_from(v).ok())
+            && tokens > max
+        {
+            return Err(S1Error::TooLong(format!(
+                "request is about {tokens} tokens; `{id}` refuses more than {max}"
+            )));
+        }
+    } else {
+        let tokens = match est {
+            Estimate::High => info.tokens_high(),
+            Estimate::Low => info.tokens_low(),
+        };
+        if let Some(ctx) = effective_context(model, tokens, flags)
+            && tokens > ctx
+        {
+            return Err(S1Error::TooLong(format!(
+                "request is about {tokens} tokens; `{id}` takes {ctx}"
+            )));
+        }
     }
     let unsupported = |what: String| Err(S1Error::Unsupported(format!("`{id}` {what}")));
     if info.assets > 0 && (model.images == Images::None || !model.compat_flag("assets", true)) {
@@ -835,6 +852,7 @@ mod tests {
         assert_eq!(e.code(), "backend_unavailable");
         assert_eq!(e.retry_after(), None, "{e}");
     }
+
     // Review R3-4.2: toward OpenAI each asset reference is one image.
     #[test]
     fn asset_references_count_per_occurrence_toward_openai() {
@@ -865,5 +883,60 @@ mod tests {
             i.toward(ProtocolId::Systemone).image_tokens(),
             crate::protocol::TOKENS_PER_IMAGE_MAX
         );
+    }
+
+    fn route_extract(c: &Catalog, info: &RouteInfo) -> Result<Route, S1Error> {
+        let reg = registry(c);
+        Router {
+            catalog: c,
+            backends: &reg,
+            available: &|_| Ok(()),
+            throttled: &|_| false,
+        }
+        .route(ProtocolId::Clairic, info, RequestFlags::default())
+    }
+
+    #[test]
+    fn extract_routes_to_clairic_and_not_to_decide_models() {
+        let c = Catalog::builtin();
+        for name in ["extract", "clairic", "workers-ai/clairic"] {
+            let r = route_extract(&c, &info(name)).unwrap();
+            assert_eq!(r.model_id, "workers-ai/clairic", "{name}");
+            assert_eq!(r.upstream, "clairic");
+        }
+        let e = route_extract(&c, &info("workers-ai/clef")).unwrap_err();
+        assert_eq!(e.code(), "wrong_family", "{e}");
+        let e = route(&c, &info("extract")).unwrap_err();
+        assert_eq!(e.code(), "wrong_family", "{e}");
+        // Clairic takes an `images` array.
+        let with_images = RouteInfo {
+            images: 4,
+            ..info("extract")
+        };
+        assert!(route_extract(&c, &with_images).is_ok());
+    }
+
+    #[test]
+    fn clairic_truncates_long_state_and_refuses_only_past_its_precheck() {
+        let c = Catalog::builtin();
+        // About 100k tokens by any estimate: over the 65,536 context, but
+        // Clairic cuts the state and flags `truncated`.
+        let long = RouteInfo {
+            input_bytes: 400_000,
+            ..info("extract")
+        };
+        assert!(route_extract(&c, &long).is_ok());
+        let named = RouteInfo {
+            input_bytes: 400_000,
+            ..info("workers-ai/clairic")
+        };
+        assert!(route_extract(&c, &named).is_ok());
+        // Workers AI refuses when `bytes / 4` exceeds 131,072.
+        let huge = RouteInfo {
+            input_bytes: 4 * 131_072 + 8,
+            ..info("extract")
+        };
+        let e = route_extract(&c, &huge).unwrap_err();
+        assert_eq!(e.code(), "too_long", "{e}");
     }
 }

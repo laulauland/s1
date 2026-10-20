@@ -1,0 +1,1 @@
+{"errors":[{"message":"AiError: AiError: Request body failed validation: state must be non-empty when no images are sent (e7e933d4-7fb2-48a2-b369-fada4925b86f)","code":3030}],"success":false,"result":{},"messages":[]}

@@ -518,6 +518,35 @@ async fn tcp_401_uses_each_typed_ingress_error_format() {
     assert_eq!(v["error"]["type"], "authentication_error", "{v}");
     assert_eq!(v["error"]["param"], Value::Null);
 
+    // /v1/extract: the Workers AI envelope (Clairic's error format), for a
+    // missing token and for a wrong token.
+    let check_extract = |v: Value| {
+        assert_eq!(v["success"], false, "{v}");
+        assert_eq!(v["result"], serde_json::json!({}), "{v}");
+        assert_eq!(v["messages"], serde_json::json!([]), "{v}");
+        assert_eq!(v["errors"][0]["code"], "unauthorized", "{v}");
+        assert!(
+            v["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("s1 auth token")
+        );
+    };
+    let r = post("/v1/extract").await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    assert_eq!(r.headers()["www-authenticate"], "Bearer");
+    check_extract(serde_json::from_slice(&r.bytes().await.unwrap()).unwrap());
+    let r = client
+        .post(format!("http://{}/v1/extract", h.server.tcp))
+        .header("content-type", "application/json")
+        .bearer_auth("wrong-token")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    check_extract(serde_json::from_slice(&r.bytes().await.unwrap()).unwrap());
+
     // Other endpoints keep the generic envelope.
     let r = post("/v1/raw/systemone").await.unwrap();
     let v: Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();

@@ -152,7 +152,7 @@ fn state_key(pid: ProtocolId) -> &'static str {
     }
 }
 
-fn json_headers(no_cache: bool, lane: Lane) -> HeaderMap {
+pub(crate) fn json_headers(no_cache: bool, lane: Lane) -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert(
         header::CONTENT_TYPE,

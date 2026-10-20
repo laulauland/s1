@@ -1,5 +1,5 @@
-//! Live smoke tests against the real TypeSafe, Workers AI and OpenAI APIs.
-//! Manual and opt-in:
+//! Live smoke tests against the real providers (TypeSafe, Workers AI Clef
+//! and Clairic, OpenAI). Manual and opt-in:
 //!
 //! ```sh
 //! S1_LIVE=1 cargo test --test live -- --ignored
@@ -386,4 +386,80 @@ async fn live_openai_decisions_both_ways() {
         .collect();
     assert!(values.contains(&&Value::Bool(true)), "{values:?}");
     assert_eq!(v["answers"][2]["probabilities"][1]["label"], "Medium");
+}
+
+/// Stage 5: `/v1/extract` through the real Clairic, by alias, and a long
+/// state that Clairic cuts and flags instead of refusing.
+#[tokio::test]
+#[ignore = "live: needs S1_LIVE=1 and Cloudflare keys"]
+async fn live_extract_clairic_via_alias_and_truncation() {
+    let Some((_dir, paths, server)) = live_server(&["workers-ai"]).await else {
+        return;
+    };
+    let post = |body: Vec<u8>| {
+        let paths = paths.clone();
+        async move {
+            let mut h = HeaderMap::new();
+            h.insert("content-type", HeaderValue::from_static("application/json"));
+            request(
+                &paths.socket,
+                Method::POST,
+                "/v1/extract",
+                h,
+                Bytes::from(body),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let mut invoice: Value = serde_json::from_slice(
+        &std::fs::read(format!(
+            "{}/tests/fixtures/clairic/invoice.request.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    invoice["model"] = Value::from("extract");
+    let reply = post(serde_json::to_vec(&invoice).unwrap()).await;
+    assert_eq!(
+        reply.status.as_u16(),
+        200,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    assert_eq!(reply.headers["s1-model"], "workers-ai/clairic");
+    let v: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert!(v.get("result").is_none(), "envelope removed");
+    assert_eq!(v["model"], "clairic");
+    assert_eq!(v["answers"]["invoice_number"]["value"], "INV-2291");
+    let cols: serde_json::Map<String, Value> = s1::protocol::clairic::Clairic
+        .flatten(&reply.body)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(cols["invoice_number__span"], serde_json::json!([8, 16]));
+    assert!(cols.contains_key("days_to_pay__p90"), "{cols:?}");
+
+    // About 76k tokens by `bytes / 4`: over the context, under the pre-check.
+    let filler = (0..7000)
+        .map(|i| format!("Line {i}: the checkout page is slow today."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let long = serde_json::json!({
+        "model": "workers-ai/clairic",
+        "state": format!("Invoice INV-77. {filler}"),
+        "fields": {"invoice_number": {"type": "text"}}
+    });
+    let reply = post(serde_json::to_vec(&long).unwrap()).await;
+    server.shutdown().await;
+    assert_eq!(
+        reply.status.as_u16(),
+        200,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    let v: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(v["truncated"], true);
+    assert_eq!(v["answers"]["invoice_number"]["value"], "INV-77");
 }

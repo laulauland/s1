@@ -125,7 +125,7 @@ impl BackendContext {
 /// Build the backend for one catalog provider, if this build supports it.
 pub fn build(name: &str, provider: &Provider, ctx: &BackendContext) -> Option<Arc<dyn Backend>> {
     match (name, provider.api) {
-        // Stage 5 adds Clairic to `workers-ai`.
+        // Workers AI serves Clef (systemone) and Clairic.
         ("workers-ai", _) => Some(Arc::new(workers_ai::WorkersAi::new(
             name,
             provider.clone(),

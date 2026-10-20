@@ -48,6 +48,12 @@ fn unauthorized_body(path: &str) -> serde_json::Value {
                 "code": CODE
             }
         }),
+        "/v1/extract" => serde_json::json!({
+            "result": {},
+            "success": false,
+            "errors": [{"code": CODE, "message": MESSAGE}],
+            "messages": []
+        }),
         _ => serde_json::json!({"error": {"code": CODE, "message": MESSAGE}}),
     }
 }

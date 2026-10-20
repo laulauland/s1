@@ -72,7 +72,8 @@ impl Keep {
 pub enum StateMode {
     /// As a JSON value (systemone takes strings, objects, and arrays).
     Value,
-    /// As JSON text (Clairic takes only a string).
+    /// As JSON text (Clairic takes only a string); images from
+    /// `--image-field` go in `images` as data URLs (read here).
     JsonText,
     /// As OpenAI Decisions `input`: JSON text; with images, one user
     /// message of an `input_text` part and `input_image` data URLs (read
@@ -361,7 +362,20 @@ fn build_body(obj: &Map<String, Value>, job: &Job, opts: &StreamOpts) -> Result<
             serde_json::to_vec(&Value::Object(body)).expect("JSON serializes"),
         ));
     }
-    if let Some(field) = &opts.image_field
+    if job.state_mode == StateMode::JsonText
+        && let Some(paths) = opts.image_field.as_ref().and_then(|f| obj.get(f))
+    {
+        // Clairic has no path assets: images go inline as data URLs, after
+        // any images in the template.
+        let urls = image_data_urls(paths)?;
+        let slot = body
+            .entry("images")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Value::Array(slot) = slot else {
+            return Err("template `images` must be an array".into());
+        };
+        slot.extend(urls.into_iter().map(Value::String));
+    } else if let Some(field) = &opts.image_field
         && let Some(paths) = obj.get(field)
     {
         let (refs, assets) = load_images(paths)?;
@@ -483,11 +497,26 @@ fn load_images(paths: &Value) -> Result<(Value, Map<String, Value>), String> {
 pub fn reply_error(status: u16, body: &[u8]) -> Value {
     let v: Option<Value> = serde_json::from_slice(body).ok();
     let pick = |v: &Value| -> Option<(String, String)> {
-        // systemone: {"detail": {"error_type", "message"}}; others: {"error": {"code"|"type", "message"}}.
+        // systemone: {"detail": {"error_type", "message"}}; Clairic (Workers AI
+        // envelope): {"errors": [{"code", "message"}]}, code a string or a number;
+        // others: {"error": {"code"|"type", "message"}}.
         if let Some(d) = v.get("detail").filter(|d| d.is_object()) {
             let code = d.get("error_type").and_then(Value::as_str)?;
             let msg = d.get("message").and_then(Value::as_str).unwrap_or("");
             return Some((code.into(), msg.into()));
+        }
+        if let Some(e) = v
+            .get("errors")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+        {
+            let code = match e.get("code")? {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                _ => return None,
+            };
+            let msg = e.get("message").and_then(Value::as_str).unwrap_or("");
+            return Some((code, msg.into()));
         }
         let e = v.get("error").filter(|e| e.is_object())?;
         let code = e
@@ -917,6 +946,48 @@ mod tests {
     }
 
     #[test]
+    fn clairic_images_are_data_urls_after_template_images() {
+        let mut j = Arc::try_unwrap(job()).ok().unwrap();
+        j.state_mode = StateMode::JsonText;
+        j.template
+            .insert("images".into(), json!(["data:image/png;base64,AAAA"]));
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n0000").unwrap();
+        let opts = StreamOpts {
+            state_field: Some("body".into()),
+            image_field: Some("photo".into()),
+            ..Default::default()
+        };
+        let obj = json!({"id": 1, "body": "hi", "photo": [png.to_str().unwrap()]});
+        let v: Value =
+            serde_json::from_slice(&build_body(obj.as_object().unwrap(), &j, &opts).unwrap())
+                .unwrap();
+        assert_eq!(v["state"], "hi", "the state stays a plain string");
+        assert!(v.get("assets").is_none(), "Clairic takes no path assets");
+        let images = v["images"].as_array().unwrap();
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0], "data:image/png;base64,AAAA");
+        assert!(
+            images[1]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+        // A line without the image field keeps the template images only.
+        let obj = json!({"id": 1, "body": "hi"});
+        let v: Value =
+            serde_json::from_slice(&build_body(obj.as_object().unwrap(), &j, &opts).unwrap())
+                .unwrap();
+        assert_eq!(v["images"], json!(["data:image/png;base64,AAAA"]));
+        // A file that is not PNG or JPEG fails the line.
+        let gif = dir.path().join("a.gif");
+        std::fs::write(&gif, b"GIF89a").unwrap();
+        let obj = json!({"body": "hi", "photo": gif.to_str().unwrap()});
+        assert!(build_body(obj.as_object().unwrap(), &j, &opts).is_err());
+    }
+
+    #[test]
     fn reply_errors_are_uniform() {
         let e = reply_error(
             503,
@@ -934,6 +1005,22 @@ mod tests {
         );
         assert_eq!(e["code"], "http_422");
         assert_eq!(e["status"], 422);
+        // Clairic: s1 errors and provider errors in the Workers AI envelope.
+        let e = reply_error(
+            413,
+            br#"{"result":{},"success":false,"errors":[{"code":"too_long","message":"big"}],"messages":[]}"#,
+        );
+        assert_eq!(
+            e,
+            json!({"code": "too_long", "message": "big", "status": 413})
+        );
+        let path = format!(
+            "{}/tests/fixtures/clairic/empty_state.422.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let e = reply_error(422, &std::fs::read(path).unwrap());
+        assert_eq!(e["code"], "3030");
+        assert!(e["message"].as_str().unwrap().contains("non-empty"));
     }
 
     proptest! {

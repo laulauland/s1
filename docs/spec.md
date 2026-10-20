@@ -91,6 +91,13 @@ The endpoint selects the family. The `model` field selects the backend. Request 
 - Fields that do not fit in one 8,192-token pass are split into parallel passes by Clairic. Context window 65,536 tokens.
 - Preview API. Pin with recorded fixtures.
 
+**As built (stage 5)** (live calls, 2026-10-20; fixtures in `tests/fixtures/clairic/`)
+
+- Same URL, auth, and envelope as Clef (`.../ai/run/@cf/cloudflare/clairic`, body `model` = `clairic`). On `/v1/extract` the client gets `result` only; provider errors keep the Workers AI envelope, which is the Clairic error format. s1 errors use the same envelope with the s1 code: `{"result": {}, "success": false, "errors": [{"code": "too_long", "message": "…"}], "messages": []}`. A missing or wrong TCP bearer token on `/v1/extract` is 401 in this envelope with code `unauthorized`.
+- Long state is cut to fit and flagged with `truncated: true` (passed through). Workers AI refuses only when `bytes / 4` exceeds twice the context (131,072): 413 code 5021, mapped to `too_long`. The catalog marks this with `compat = { truncates = true, max_request_tokens = 131072 }`, and the router checks only that limit for such models.
+- s1 refuses before the call what Clairic surely refuses: a non-string or empty state without images, no `fields`, and remote image URLs (`invalid_request`); more than 4 images (`unsupported`); an image over 4 MiB or images over 8 MiB in total, decoded (`too_long`). Other validation (field specs, unknown top-level fields) is left to Clairic.
+- Undocumented answer keys seen live: `duration` answers carry `unit`; image-sourced text answers have `span: null`, `source: "image"`, and `spell_confidence`; `forecast` answers have `value`, `median`, `p10`, `p90` as arrays plus `steps`.
+
 ### Forecast: TSFM.ai contract
 
 - Request: `model`, `inputs: [{target: [...], ...covariates}]`, `parameters: {prediction_length, quantiles}`. Many series per request.
@@ -196,7 +203,7 @@ trait Translate {
 | --- | --- | --- |
 | TypeSafe Jev | systemone | Image header; long-context header (s1 adds it when the request is over 64k tokens or one question, that is the state plus that question, is over 32k); missing key returns 403, not 401 (the typed `/v1/systemone` ingress turns it into a clear 401 with `s1-upstream-status: 403`; `/v1/raw` returns the 403 unchanged) |
 | Workers AI Clef | systemone | Model in the URL path and in the body (must match); Workers AI envelope around the response; docs say long input is silently truncated, but live calls get an explicit error (mapped to `too_long`); no `assets` (takes an `images` array); 1 to 64 questions, at least 2 options and 2 levels; every question needs non-blank `instructions`; question names `[A-Za-z0-9_.-]`, 1 to 100 characters (alias routing skips Clef when these do not fit) |
-| Workers AI Clairic | clairic | Same URL and envelope as Clef; preview format |
+| Workers AI Clairic | clairic | Same URL and envelope as Clef; preview format; long state cut and flagged `truncated` (not refused) up to `bytes / 4` = 2 × context; errors keep the envelope |
 | OpenAI Decisions | openai-decisions | Public beta; refusals per question |
 
 **Translation rules: OpenAI Decisions and systemone**
@@ -220,7 +227,7 @@ trait Translate {
 - Image URL fetch (toward systemone): only `https` URLs whose host is, or resolves only to, public addresses (no loopback, private, link-local, shared, documentation, multicast, or reserved ranges, and no IPv6 forms of them). The check runs in the fetch client's DNS resolver, so the checked address is the one connected to, and again on each redirect (at most 5); no proxy. All images of one request share one budget, checked while the bytes arrive: the body with images inlined must stay within the 64 MiB body limit, else `too_long`. At most 16 downloads run at a time in the daemon. Errors and logs name an image by position (`input[0].content[1]`), never by URL. A key spelled with JSON escapes (`"image\u005furl"`) counts as `image_url`.
 - Placeholders made toward systemone are absent from the input text and from every string in the questions. Toward OpenAI, a structured (object or list) `state` goes as its compact JSON text, cut into image parts only at asset references inside its string values (not object keys), matched before JSON escaping.
 - Flat columns of OpenAI choice values are one-to-one: `true` / `false` are `bool:true` / `bool:false`, other non-strings are `json:<compact JSON>` (`json:1`, `json:null`), and a string that starts with `bool:`, `json:`, or `str:` gets a `str:` prefix (`str:bool:true`). Score columns stay `q__p__<level>`.
-- A missing or wrong TCP bearer token is 401 in the endpoint's format: `/v1/systemone` gives `{"detail": {"error_type": "unauthorized", …}}`, `/v1/decisions` the OpenAI error shape with `type` `authentication_error` and `code` `unauthorized`; other endpoints keep the generic `{"error": {"code", "message"}}`.
+- A missing or wrong TCP bearer token is 401 in the endpoint's format: `/v1/systemone` gives `{"detail": {"error_type": "unauthorized", …}}`, `/v1/decisions` the OpenAI error shape with `type` `authentication_error` and `code` `unauthorized`; endpoints without a typed ingress keep the generic `{"error": {"code", "message"}}`.
 - The router accepts any backend whose format can be translated from the ingress (`Route.api`); the ingress translates the request after the cache lookup and the answer before the cache store, so the cache holds client-format answers.
 - Names: a free client name is kept; an unnamed question gets `q{i}`; a taken name gets `_1`, `_2`, …. Answers to OpenAI clients have the client's `name` (or `null`).
 - Noul criteria go to OpenAI as `\n\nTrue if: …` and `\n\nFalse if: …` suffixes on `instructions`; from OpenAI they are read back into `criteria`. Client text that holds `True if: ` or `False if: ` is escaped with a U+200B (zero width space) before the colon (one more for each U+200B already there), so only s1's own suffixes have none and the client text reads back unchanged.
@@ -311,7 +318,8 @@ cat tickets.jsonl \
 ```
 
 - One JSON line in, one JSON line out. The `id` field passes through (`--id-field` to change it).
-- `--state-field <name>`: what the model reads. With it, s1 sends only that field as the state. Default: the whole line. For systemone the line is sent as an object; for Clairic it is sent as JSON text, because Clairic takes only a string. `--image-field <name>` reads image paths.
+- `s1 extract` input: a text argument is the state, and `-` reads all of stdin as the state. Without an argument, stdin is JSON lines when `--jsonl` is given or its first non-blank line is a JSON object; otherwise all of stdin is one state (so `s1 extract -t t.json < invoice.txt` works).
+- `--state-field <name>`: what the model reads. With it, s1 sends only that field as the state. Default: the whole line. For systemone the line is sent as an object; for Clairic it is sent as JSON text, because Clairic takes only a string. `--image-field <name>` reads image paths (a path or a list). `s1 decide` sends them as path assets; `s1 extract` reads the files and sends them inline as data URLs in Clairic `images`, after any images in the template, because Clairic has no path assets.
 - `--keep <fields>`: what the output carries besides `id` and the answers. Default: nothing. `--keep body,customer` copies those input fields; `--keep '*'` copies the whole input line, including answer columns from an earlier step. If a kept field has the same name as a new answer column, s1 stops with an error and does not overwrite it.
 - Output order: input order by default; `--unordered` writes in completion order.
 - `--flat` writes flat columns (below). Without it, each line holds `id`, the kept fields, and the provider response under `response`.
@@ -340,6 +348,8 @@ Each final line holds the ticket, the topic answers, the billing answers, and th
 | Decide: noul / predicate | `q` (probability of yes) |
 | Extract: scalar | `f`, `f__conf`, `f__p_null`, `f__guess`, `f__span` |
 | Extract: estimate | `f`, `f__median`, `f__p10`, `f__p90` |
+| Extract: forecast field | `f`, `f__median`, `f__p10`, `f__p90` (arrays, one item per step) |
+| Extract: list | `f`, `f__conf`, `f__spans` |
 | Forecast | Long format: `id`, `step`, `timestamp`, `q<level>` per quantile |
 
 ### MCP

@@ -191,7 +191,7 @@ pub fn fake_response(req: &Value, model: &str) -> Value {
     json!({"model": model, "answers": answers, "usage": {"input_tokens": 100, "output_tokens": 0}})
 }
 
-/// Mock of Workers AI `POST /accounts/{account}/ai/run/{*model}` for Clef,
+/// Mock of Workers AI `POST /accounts/{account}/ai/run/{*model}` for Clef and Clairic,
 /// with the behaviour seen live (fixtures in `workers-ai/`).
 pub fn mock_workers_ai_router(rec: Recorder) -> Router {
     Router::new()
@@ -241,6 +241,9 @@ async fn workers_ai_run(
             .into_response();
     }
     let selector = model.rsplit('/').next().unwrap_or("").to_string();
+    if selector == "clairic" {
+        return clairic_run(&body).await;
+    }
     let ctx: usize = match selector.as_str() {
         "clef-flash" => 24576,
         _ => 65536,
@@ -469,6 +472,128 @@ pub fn fake_openai_answer(q: &Value, input: &str) -> Value {
         }
         _ => json!({"type": "refusal", "name": name}),
     }
+}
+
+/// Clairic with the behaviour seen live (fixtures in `clairic/`): the
+/// `bytes / 4` pre-check against twice the context, schema errors, and
+/// long state cut to fit with `truncated: true`.
+async fn clairic_run(body: &[u8]) -> Response {
+    const CTX: usize = 65536;
+    let parsed = serde_json::from_slice::<Value>(body);
+    let image_bytes: usize = parsed
+        .as_ref()
+        .ok()
+        .and_then(|r| r["images"].as_array())
+        .map_or(0, |a| {
+            a.iter().map(|i| i.as_str().map_or(0, str::len)).sum()
+        });
+    let text_bytes = body.len().saturating_sub(image_bytes);
+    if text_bytes / 4 > 2 * CTX {
+        return envelope_reply(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            fixture("clairic/context_estimate.413.json"),
+        );
+    }
+    let Ok(req) = parsed else {
+        return envelope_reply(
+            StatusCode::BAD_REQUEST,
+            fixture("clairic/bad_type.400.json"),
+        );
+    };
+    if !matches!(
+        req["model"].as_str(),
+        Some("clairic" | "@cf/cloudflare/clairic")
+    ) {
+        return envelope_reply(
+            StatusCode::BAD_REQUEST,
+            fixture("clairic/model_mismatch.400.json"),
+        );
+    }
+    if !req["state"].is_string() && !req["state"].is_null() {
+        return envelope_reply(
+            StatusCode::BAD_REQUEST,
+            fixture("clairic/object_state.400.json"),
+        );
+    }
+    let allowed = [
+        "model",
+        "state",
+        "fields",
+        "images",
+        "reference_date",
+        "options",
+    ];
+    if req
+        .as_object()
+        .unwrap()
+        .keys()
+        .any(|k| !allowed.contains(&k.as_str()))
+    {
+        return envelope_reply(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            fixture("clairic/extra_field.422.json"),
+        );
+    }
+    if req["images"].as_array().is_some_and(|a| a.len() > 4) {
+        return envelope_reply(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            fixture("clairic/too_many_images.422.json"),
+        );
+    }
+    let fixture_req: Value =
+        serde_json::from_slice(&fixture("clairic/invoice.request.json")).unwrap();
+    if req == fixture_req {
+        return envelope_reply(StatusCode::OK, fixture("clairic/invoice.response.json"));
+    }
+    mock_sleep(&req).await;
+    let mut result = fake_clairic(&req);
+    if text_bytes / 4 > CTX {
+        result["truncated"] = json!(true);
+    }
+    let env = json!({"result": result, "success": true, "errors": [], "messages": []});
+    envelope_reply(StatusCode::OK, serde_json::to_vec(&env).unwrap())
+}
+
+/// Deterministic Clairic answers: a text field is the first word of the
+/// state (with its span); numbers 42; dates 2026-10-02; lists every word;
+/// estimates 30 (p10 20, p90 40); anything else null.
+pub fn fake_clairic(req: &Value) -> Value {
+    let state = req["state"].as_str().unwrap_or("");
+    let first = state.split_whitespace().next().unwrap_or("");
+    let start = state.find(first).unwrap_or(0);
+    let mut answers = serde_json::Map::new();
+    for (name, f) in req["fields"].as_object().into_iter().flatten() {
+        let ty = f["type"].as_str().unwrap_or("");
+        let a = match ty {
+            "text" => {
+                json!({"type": ty, "p_null": 0.01, "span": [start, start + first.len()], "guess": first, "confidence": 0.99, "value": first})
+            }
+            "number" => {
+                json!({"type": ty, "p_null": 0.01, "guess": 42, "confidence": 0.9, "value": 42})
+            }
+            "date" => {
+                json!({"type": ty, "p_null": 0.01, "guess": "2026-10-02", "confidence": 0.9, "value": "2026-10-02"})
+            }
+            "list" => {
+                let words: Vec<&str> = state.split_whitespace().collect();
+                json!({"type": ty, "value": words, "spans": [], "confidence": 0.9})
+            }
+            "estimate" => {
+                json!({"type": ty, "value": 30, "mean": 30.1, "median": 30, "p10": 20, "p90": 40, "p_below": 0.0, "p_above": 0.0})
+            }
+            _ => {
+                json!({"type": ty, "p_null": 1.0, "guess": null, "confidence": 0.5, "value": null})
+            }
+        };
+        answers.insert(name.clone(), a);
+    }
+    let images = req["images"].as_array().map_or(0, Vec::len);
+    json!({
+        "model": "clairic",
+        "answers": answers,
+        "truncated": false,
+        "usage": {"state_tokens": state.len() / 4, "image_tokens": 64 * images, "schema_tokens": 100, "input_tokens": 100 + state.len() / 4, "output_tokens": 0, "passes": 1}
+    })
 }
 
 /// All mocks, started in the current runtime.

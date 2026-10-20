@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::error::S1Error;
 
+pub mod clairic;
 pub mod openai_decisions;
 pub mod systemone;
 
@@ -95,7 +96,7 @@ pub struct RouteInfo {
     /// Request size in bytes, without image payloads (see `image_bytes`).
     pub input_bytes: usize,
     /// Bytes of image payloads (systemone `assets.*.data_base64`, Clef
-    /// `images` items). Images are counted per image, not per byte.
+    /// and Clairic `images` items). Images are counted per image, not per byte.
     pub image_bytes: usize,
     /// Number of questions (or fields).
     pub questions: u32,
@@ -126,6 +127,10 @@ pub struct RouteInfo {
     /// A question name outside `[A-Za-z0-9_.-]`, 1 to 100 characters
     /// (the names Clef accepts).
     pub loose_question_names: bool,
+    /// Decoded bytes of the largest image (Clairic `images`; 0 if not counted).
+    pub largest_image_bytes: usize,
+    /// Decoded bytes of all images (Clairic `images`; 0 if not counted).
+    pub images_decoded_bytes: usize,
 }
 
 /// Bytes per token for a conservative estimate (real text with JSON
@@ -194,6 +199,11 @@ pub trait Protocol: Send + Sync {
     }
     /// Read only what routing needs; keep the body as bytes.
     fn inspect(&self, body: &[u8]) -> Result<RouteInfo, InspectError>;
+    /// Limits of the format itself, checked after `inspect` on a typed
+    /// ingress (for example Clairic's image count and sizes).
+    fn check(&self, _info: &RouteInfo) -> Result<(), S1Error> {
+        Ok(())
+    }
     /// Turn a response into flat columns for `--flat`.
     fn flatten(&self, resp: &[u8]) -> Result<Vec<(String, Value)>, InspectError>;
     /// Render an s1 error in this format.
@@ -205,6 +215,7 @@ pub fn by_id(id: ProtocolId) -> Option<&'static dyn Protocol> {
     match id {
         ProtocolId::Systemone => Some(&systemone::Systemone),
         ProtocolId::OpenaiDecisions => Some(&openai_decisions::OpenaiDecisions),
+        ProtocolId::Clairic => Some(&clairic::Clairic),
         _ => None,
     }
 }

@@ -12,6 +12,7 @@ mod cache;
 pub mod client;
 mod daemon;
 pub mod decide;
+pub mod extract;
 mod models;
 mod raw;
 mod status;
@@ -37,6 +38,8 @@ enum Cmd {
     Models(models::ModelsArgs),
     /// Ask Decide questions: one text, or one JSON line in, one line out.
     Decide(decide::DecideArgs),
+    /// Extract typed values: one text or document, or one JSON line in, one line out.
+    Extract(extract::ExtractArgs),
     /// Queues, limits, and breakers per backend; cache size.
     Status(status::StatusArgs),
     /// Manage the response cache.
@@ -61,6 +64,7 @@ pub fn main() -> ExitCode {
         Cmd::Models(args) => models::run(args, &paths),
         Cmd::Auth { cmd } => auth::run(cmd, &paths),
         Cmd::Decide(args) => decide::run(args, &paths),
+        Cmd::Extract(args) => extract::run(args, &paths),
         Cmd::Status(args) => status::run(args, &paths),
         Cmd::Cache { cmd } => cache::run(cmd, &paths),
     };
@@ -138,6 +142,28 @@ mod tests {
                 "4",
                 "-m",
                 "decide",
+            ],
+            &["s1", "extract", "-t", "t.json", "text"],
+            &["s1", "extract", "-t", "t.json", "-"],
+            &[
+                "s1",
+                "extract",
+                "-t",
+                "t.json",
+                "--jsonl",
+                "--flat",
+                "--id-field",
+                "key",
+                "--state-field",
+                "body",
+                "--keep",
+                "*",
+                "--unordered",
+                "-j",
+                "4",
+                "-m",
+                "extract",
+                "--no-cache",
             ],
         ] {
             Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));

@@ -1,6 +1,6 @@
 //! Cloudflare Workers AI: `POST {base_url}/accounts/{account}/ai/run/@cf/cloudflare/{model}`
-//! with a bearer API token. Serves Clef (systemone) now; Clairic (stage 5)
-//! uses the same URL and envelope.
+//! with a bearer API token. Serves Clef (systemone) and Clairic (clairic)
+//! with the same URL, envelope, and error handling.
 //!
 //! [`Backend::call`] only selects the URL path from the upstream id; the
 //! request and response bytes are unchanged, so `/v1/raw` is a pure
@@ -25,6 +25,10 @@
 //!   (images counted per image, see [`crate::protocol::RouteInfo`]). A
 //!   success whose `usage.input_tokens` reaches the context is treated as
 //!   truncated (`too_long`), for models with `compat.silent_truncation`.
+//! - Clairic cuts long state itself and flags it (`truncated: true` in the
+//!   result, passed through). It refuses only when `bytes / 4` exceeds twice
+//!   its context (413, code 5021, `too_long`). Its other errors keep the
+//!   Workers AI envelope, which is the Clairic error format.
 
 use async_trait::async_trait;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -213,7 +217,7 @@ impl Backend for WorkersAi {
     }
 
     fn protocols(&self) -> &[ProtocolId] {
-        &[ProtocolId::Systemone]
+        &[ProtocolId::Systemone, ProtocolId::Clairic]
     }
 
     fn caps(&self, model: &str) -> Option<&Model> {
@@ -319,7 +323,7 @@ impl Backend for WorkersAi {
             Unwrapped::Errors(errors) => {
                 let body = match self.protocol_of(model) {
                     ProtocolId::Systemone => systemone_error(status, &errors),
-                    // Stage 5 renders Clairic errors; until then keep the envelope.
+                    // Clairic's own error format is the envelope.
                     _ => raw,
                 };
                 headers.insert(header::CONTENT_TYPE, json_type);
@@ -449,5 +453,66 @@ mod tests {
                 .unwrap()
                 .contains("Authentication error")
         );
+    }
+
+    fn clairic_fixture(name: &str) -> Vec<u8> {
+        fixture(&format!("../clairic/{name}"))
+    }
+
+    fn backend() -> WorkersAi {
+        use crate::secrets::KeyResolver;
+        let provider = crate::catalog::Catalog::builtin().providers["workers-ai"].clone();
+        let ctx = BackendContext::new(KeyResolver::new("/nonexistent/auth.json".into(), |_| None));
+        WorkersAi::new("workers-ai", provider, ctx)
+    }
+
+    fn reply(status: u16, body: Vec<u8>) -> ProviderResponse {
+        ProviderResponse {
+            status: StatusCode::from_u16(status).unwrap(),
+            headers: HeaderMap::new(),
+            body: Bytes::from(body),
+        }
+    }
+
+    #[test]
+    fn clairic_is_served_with_the_clef_url_and_envelope() {
+        let b = backend();
+        assert!(b.protocols().contains(&ProtocolId::Clairic));
+        assert!(b.protocols().contains(&ProtocolId::Systemone));
+        assert_eq!(
+            model_ids("clairic"),
+            ("@cf/cloudflare/clairic".to_string(), "clairic".to_string())
+        );
+        // Success: the envelope goes; a truncated result passes through.
+        for name in ["invoice.response.json", "truncated.response.json"] {
+            let r = b
+                .typed_response("clairic", reply(200, clairic_fixture(name)))
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+            assert_eq!(v["model"], "clairic", "{name}");
+            assert!(v.get("success").is_none(), "{name}");
+            assert_eq!(r.headers[header::CONTENT_TYPE], "application/json");
+        }
+        // The size pre-check: too_long.
+        let e = b
+            .typed_response(
+                "clairic",
+                reply(413, clairic_fixture("context_estimate.413.json")),
+            )
+            .unwrap_err();
+        assert_eq!(e.code(), "too_long", "{e}");
+        // Validation errors keep the envelope (Clairic's error format) and status.
+        for (name, status) in [
+            ("image_too_large.422.json", 422),
+            ("empty_state.422.json", 422),
+            ("bad_type.400.json", 400),
+        ] {
+            let raw = clairic_fixture(name);
+            let r = b
+                .typed_response("clairic", reply(status, raw.clone()))
+                .unwrap();
+            assert_eq!(r.status.as_u16(), status, "{name}");
+            assert_eq!(r.body.as_ref(), raw.as_slice(), "{name}");
+        }
     }
 }

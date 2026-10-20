@@ -1,0 +1,1 @@
+{"result":{"model":"clairic","answers":{"invoice_number":{"type":"text","p_null":0.012983211316168308,"span":[8,14],"guess":"INV-77","confidence":0.9997952580451965,"value":"INV-77"}},"truncated":true,"usage":{"state_tokens":65417,"image_tokens":0,"schema_tokens":112,"input_tokens":65529,"output_tokens":0,"passes":1}},"success":true,"errors":[],"messages":[]}

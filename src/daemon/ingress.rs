@@ -20,7 +20,7 @@
 //! in the client's format. The cache keeps the client-format answer.
 //!
 //! One handler serves every wire format; each endpoint is one line in
-//! [`routes`] (stage 5 adds `/v1/extract`).
+//! [`routes`] (`/v1/systemone`, `/v1/decisions`, `/v1/extract`).
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -62,6 +62,14 @@ pub fn routes() -> Router<AppState> {
             post(
                 |st: State<AppState>, o: Option<Extension<Origin>>, h: HeaderMap, b: Body| {
                     handle(st, ProtocolId::OpenaiDecisions, origin(o), h, b)
+                },
+            ),
+        )
+        .route(
+            "/v1/extract",
+            post(
+                |st: State<AppState>, o: Option<Extension<Origin>>, h: HeaderMap, b: Body| {
+                    handle(st, ProtocolId::Clairic, origin(o), h, b)
                 },
             ),
         )
@@ -126,6 +134,9 @@ pub async fn handle(
     // limiter cost count them per reference (spec "Translation rules").
     if pid == ProtocolId::Systemone && info.assets > 0 {
         info.openai_images = translate::decide::openai_image_occurrences(&body);
+    }
+    if let Err(err) = p.check(&info) {
+        return error_response(proto, &err, &rid, None);
     }
     let flags = flags(&headers);
     let lane = Lane::from_headers(&headers);
