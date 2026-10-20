@@ -1491,6 +1491,7 @@ dependencies = [
  "bytes",
  "clap",
  "flate2",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",

@@ -14,7 +14,12 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn list(State(st): State<AppState>) -> Json<serde_json::Value> {
-    Json(st.catalog.to_models_json(|m| {
+    Json(models_json(&st))
+}
+
+/// The `/v1/models` body (also the MCP `models` tool result).
+pub(crate) fn models_json(st: &AppState) -> serde_json::Value {
+    st.catalog.to_models_json(|m| {
         let guard = st.existing_guard(m.provider_name);
         let breaker_open = guard.as_ref().is_some_and(|g| g.breaker_open());
         ModelState {
@@ -25,5 +30,5 @@ async fn list(State(st): State<AppState>) -> Json<serde_json::Value> {
                 .map(rfc3339),
             breaker_open,
         }
-    }))
+    })
 }

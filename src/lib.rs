@@ -17,6 +17,7 @@
 //! - [`cache`] - response cache (blake3 key, redb store, model versions).
 //! - [`flatten`] - `--flat` column names and template name checks.
 //! - [`images`] - image file paths in systemone `assets` (Unix socket only).
+//! - [`mcp`] - stateless MCP endpoint (`POST /mcp`) and its tools.
 //! - [`daemon`] - the axum router, its handlers, and the listeners.
 //! - [`cli`] - the `s1` command line.
 
@@ -32,6 +33,7 @@ pub mod flatten;
 pub mod images;
 pub mod limits;
 pub mod logging;
+pub mod mcp;
 pub mod paths;
 pub mod protect;
 pub mod protocol;

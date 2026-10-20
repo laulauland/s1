@@ -463,3 +463,90 @@ async fn live_extract_clairic_via_alias_and_truncation() {
     assert_eq!(v["truncated"], true);
     assert_eq!(v["answers"]["invoice_number"]["value"], "INV-77");
 }
+
+/// Stage 6: an MCP `decide` list call over `POST /mcp` (Clef via the
+/// `decide` alias) and an `extract` list call (Clairic), two tiny states each.
+#[tokio::test]
+#[ignore = "live: needs S1_LIVE=1 and Cloudflare keys"]
+async fn live_mcp_decide_and_extract_lists() {
+    let Some((_dir, paths, server)) = live_server(&["workers-ai"]).await else {
+        return;
+    };
+    let call = |tool: &str, args: Value| {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": tool, "arguments": args,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            },
+        });
+        let mut h = HeaderMap::new();
+        h.insert("content-type", HeaderValue::from_static("application/json"));
+        h.insert(
+            "accept",
+            HeaderValue::from_static("application/json, text/event-stream"),
+        );
+        h.insert(
+            "mcp-protocol-version",
+            HeaderValue::from_static("2026-07-28"),
+        );
+        h.insert("mcp-method", HeaderValue::from_static("tools/call"));
+        h.insert("mcp-name", HeaderValue::from_str(tool).unwrap());
+        let socket = paths.socket.clone();
+        async move {
+            request(
+                &socket,
+                Method::POST,
+                "/mcp",
+                h,
+                Bytes::from(serde_json::to_vec(&body).unwrap()),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let decide = call(
+        "decide",
+        serde_json::json!({
+            "template": {"model": "decide", "questions": {"urgent": {"type": "noul", "instructions": "Is this support request urgent?"}}},
+            "states": [
+                {"id": "a", "state": "Checkout is down for every customer."},
+                {"id": "b", "state": "Could you add a dark mode some day?"},
+            ],
+        }),
+    )
+    .await;
+    let extract = call(
+        "extract",
+        serde_json::json!({
+            "template": {"model": "extract", "fields": {"invoice_number": {"type": "text"}, "total": {"type": "number"}}},
+            "states": [
+                {"id": 1, "state": "Invoice INV-2291, total due 1,080.00 USD."},
+                {"id": 2, "state": "Invoice INV-77 for 12.50 USD."},
+            ],
+        }),
+    )
+    .await;
+    server.shutdown().await;
+    for (name, reply) in [("decide", &decide), ("extract", &extract)] {
+        assert_eq!(
+            reply.status.as_u16(),
+            200,
+            "{name}: {}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        let v: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(v["result"]["isError"], false, "{name}: {v}");
+        let results = v["result"]["structuredContent"]["results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results.len(), 2, "{name}");
+        for r in results {
+            assert_eq!(r["ok"], true, "{name}: {r}");
+        }
+        eprintln!("{name}: {}", v["result"]["structuredContent"]);
+    }
+}

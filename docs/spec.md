@@ -54,7 +54,7 @@ The forecast ingress exists in v1 so that the format is reserved, but it has no 
   - `s1 decide --image-field` sends paths this way, so the CLI and other local clients share one code path.
 - Reuse connections to providers (HTTP/2 where the provider supports it, else keep-alive pools).
 
-**Crates:** `tokio`, `axum`, `hyper`, `reqwest`, `serde_json`, `tokenizers`, `governor`, `clap`, `blake3`, `tracing`, `proptest`. MCP: `rmcp` if it supports the 2026-07-28 stateless transport, else a small hand-written handler.
+**Crates:** `tokio`, `axum`, `hyper`, `reqwest`, `serde_json`, `tokenizers`, `governor`, `clap`, `blake3`, `tracing`, `proptest`. MCP: a small hand-written handler for the 2026-07-28 stateless transport (`server/discover`, `tools/list`, `tools/call` only). `rmcp` 3.x supports that transport too, but s1 does not use it: three methods do not justify the dependency, and the tools call the ingress handler in-process (see "As built (stage 6)" under MCP).
 
 ## API families and wire formats
 
@@ -369,6 +369,19 @@ Each final line holds the ticket, the topic answers, the billing answers, and th
 - Tool descriptions state the item limit and say that lists are for use from code, so a model calling the tool directly does not fill its context.
 - Progress notifications during long list calls, if the stateless transport allows them in the response stream. Otherwise the item cap keeps calls inside client timeouts.
 
+**As built (stage 6)**
+
+- A small hand-written handler in `src/mcp/` (not `rmcp`). `rmcp` 3.x does support the 2026-07-28 stateless transport and progress on the response stream, but s1 needs only three methods, and its list tools call the typed ingress handler in-process. No new crate apart from `http-body`.
+- Methods: `server/discover`, `tools/list`, `tools/call`. Other methods get 404 and `-32601`. `initialize` gets `-32022` with the supported versions. Notifications get 202. GET and DELETE get 405.
+- Each request needs the `MCP-Protocol-Version` and `Mcp-Method` headers (and `Mcp-Name` for `tools/call`, also in the `=?base64?…?=` form) that match the body, else 400 and `-32020`. `params._meta` needs `protocolVersion` and `clientCapabilities`, else 400 and `-32602`. Any version other than 2026-07-28 gets 400 and `-32022`. A foreign `Origin` gets 403. TCP needs the `s1-local` bearer token (401 with `WWW-Authenticate: Bearer`); the Unix socket does not.
+- `tools/list` has `ttlMs` (1 h), `cacheScope: public`, and `_meta["s1/catalogVersion"]` (a hash of the tool list). The descriptions name the models and aliases of the family, so the list changes only with the catalog.
+- List items: each state is one request to the typed ingress (`/v1/systemone` or `/v1/extract` logic) in the bulk lane, so it uses routing, the cache, limits, retries, and the breaker. The `id` defaults to the index. `extract` sends a non-string state as JSON text and takes `images` (data URLs) per item. A result item is `{id, ok, answers, model}` (`extract` adds `truncated`) or `{id, ok: false, error: {code, message, status?}}`. Bad items, bad template fields, and provider errors are item errors. Calls with 0 or more than 1,000 states, or with bad arguments, are tool errors (`isError: true`, code `invalid_request`).
+- Items in flight follow the backend's in-flight cap (8 when there is no scheduler yet).
+- Pre-run estimate: every item is built, inspected, and routed (one at a time; nothing is kept), and items are grouped by backend. Per group: `(waiting + in flight + items) / rate + provider pause`, with the group's mean input tokens. The rate is the larger of the observed drain rate and the in-flight cap per second, then capped by the RPM and TPM limits (the limits always win). Items that cannot be built, fail the protocol's own checks (for example too many images for Clairic), or cannot be routed are left out of the estimate and get their own per-item error. If any group's estimate is more than 80 % of `timeout_secs` (a tool argument, default 60 s), the call fails before any request is sent: a tool error with code `queue_full`, `items` (the items estimated), `estimated_secs`, `suggested_chunk_size` (what fits now, or after the backlog drains: the longest prefix of the estimated items whose own per-group estimate fits, so resubmitting that many items is not refused again however uneven their sizes), and `retry_after_secs` (0 = now). When not even one item fits an idle backend, no chunk size helps: the error also has `required_timeout_secs`, the `timeout_secs` that lets one item run now. Cache hits are not subtracted, so the estimate is high when many items are cached.
+- Item bodies are built when their item starts, not up front: at most the in-flight window of bodies, and at most 64 MiB of them (one body always runs), are held at once.
+- `tools/call` `arguments`: omitted means `{}`; any other non-object (null, array, scalar) is JSON-RPC error -32602.
+- Progress: with `_meta.progressToken`, the reply becomes `text/event-stream` (`event: message`, `data: <json>`) when the first item finishes: `notifications/progress` (`progress` = items done, `total` = items, at most one every 100 ms), then the result. A call that ends before its first progress event gets plain JSON. Closing the stream cancels the call: requests not yet sent are not sent.
+
 ## Cache, logging, secrets, config
 
 No request payloads are stored. The cache keeps only key hashes and responses; logs keep metadata only.
@@ -459,7 +472,7 @@ Each milestone ends with something usable from the shell.
 
 ## Open questions
 
-- Does `rmcp` support the 2026-07-28 stateless transport, and can a stateless call stream progress?
+- ~~Does `rmcp` support the 2026-07-28 stateless transport, and can a stateless call stream progress?~~ Answered in milestone 6: yes (`rmcp` 3.0 and later, stateless by default, progress on the response stream). s1 uses a small hand-written handler anyway (see "As built (stage 6)" under MCP).
 - ~~Is Clef fully systemone-compatible in practice (limits, error shapes, truncation)?~~ Answered in milestone 2 (live calls, 2026-10-20): answers and usage have the systemone shape; requests differ (no `box`, no `assets`, unknown fields rejected, 1 to 64 questions, at least 2 options and 2 levels, non-blank `instructions` required, question names `[A-Za-z0-9_.-]{1,100}`). Errors use the Workers AI envelope. Over-context input is rejected (413 code 5021 when `bytes / 4` exceeds the context, image data not counted; 422 code 3030 "Request requires N tokens"), not silently truncated. Fixtures: `tests/fixtures/workers-ai/`.
 - Real rate limits for each provider account, to replace the placeholder numbers.
 - Item cap for MCP list calls (1,000 is a guess). Measure against client timeouts.

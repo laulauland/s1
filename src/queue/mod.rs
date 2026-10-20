@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 mod scheduler;
 
-pub use scheduler::{Permit, Scheduler, Snapshot};
+pub use scheduler::{Estimate, Permit, Scheduler, Snapshot};
 
 /// Client header that picks the lane: `interactive` (default) or `bulk`.
 pub const LANE_HEADER: &str = "s1-lane";

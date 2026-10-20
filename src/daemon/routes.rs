@@ -14,6 +14,7 @@ pub fn router(state: AppState) -> Router {
         .merge(cache::routes())
         .merge(raw::routes())
         .merge(ingress::routes())
+        .merge(crate::mcp::routes())
         .with_state(state)
 }
 

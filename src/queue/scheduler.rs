@@ -212,6 +212,55 @@ impl Scheduler {
         (secs.ceil() as u64).clamp(1, MAX_RETRY_AFTER_SECS)
     }
 
+    /// Estimate how long `items` new requests of `tokens_each` input tokens
+    /// take to finish, behind the requests that wait already (MCP list
+    /// calls check this before they start).
+    ///
+    /// The rate is the larger of the observed drain rate and a capacity
+    /// guess (the in-flight cap per second, about one second per call),
+    /// then lowered to the RPM and TPM limits. A provider pause adds its
+    /// length.
+    pub fn estimate(&self, items: usize, tokens_each: u64) -> Estimate {
+        let mut st = self.lock();
+        let now = Instant::now();
+        trim_done(&mut st.done, now);
+        let elapsed = now.duration_since(self.created).min(DRAIN_WINDOW);
+        let observed = if st.done.is_empty() || elapsed.is_zero() {
+            0.0
+        } else {
+            st.done.len() as f64 / elapsed.as_secs_f64().max(1.0)
+        };
+        // The RPM and TPM limits are hard ceilings: a high observed rate
+        // (many small requests) must not lift big requests above them.
+        let mut ceiling = f64::INFINITY;
+        if let Some(rpm) = self.limits.rpm {
+            ceiling = ceiling.min(rpm as f64 / 60.0);
+        }
+        if let Some(tpm) = self.limits.tpm
+            && tokens_each > 0
+        {
+            ceiling = ceiling.min(tpm as f64 / 60.0 / tokens_each as f64);
+        }
+        let capacity = f64::from(st.gate.cap().max(1));
+        // Config rejects zero limits, so the rate is positive; the guard
+        // only keeps a degenerate value from dividing by zero. Rates below
+        // 0.001 per second are real (huge requests under a small TPM) and
+        // stay as they are.
+        let rate = observed.max(capacity).min(ceiling);
+        let rate = if rate > 0.0 { rate } else { f64::MIN_POSITIVE };
+        let pause = st
+            .gate
+            .throttled_until(now)
+            .map_or(0.0, |u| (u - now).as_secs_f64());
+        let backlog = st.queue.len() + st.gate.in_flight() as usize;
+        Estimate {
+            rate,
+            backlog,
+            pause_secs: pause,
+            secs: (backlog + items) as f64 / rate + pause,
+        }
+    }
+
     /// True if a new request would wait: a provider pause, a queue, or no
     /// room under the limits. Aliases with `spill = true` skip such entries.
     pub fn throttled(&self) -> bool {
@@ -349,6 +398,36 @@ impl Scheduler {
     }
 }
 
+/// Run-time estimate for a batch of new requests ([`Scheduler::estimate`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Estimate {
+    /// Requests per second the backend is expected to finish.
+    pub rate: f64,
+    /// Requests that wait or are in flight already.
+    pub backlog: usize,
+    /// Provider pause still to wait, in seconds.
+    pub pause_secs: f64,
+    /// Seconds until the last of the new requests finishes.
+    pub secs: f64,
+}
+
+impl Estimate {
+    /// Most new requests that finish within `budget_secs` (0 if none).
+    pub fn fits_in(&self, budget_secs: f64) -> usize {
+        let room = (budget_secs - self.pause_secs) * self.rate - self.backlog as f64;
+        if room <= 0.0 {
+            0
+        } else {
+            room.floor() as usize
+        }
+    }
+
+    /// Seconds until the current backlog and pause are gone.
+    pub fn drain_secs(&self) -> f64 {
+        self.backlog as f64 / self.rate + self.pause_secs
+    }
+}
+
 fn trim_done(done: &mut VecDeque<Instant>, now: Instant) {
     while done
         .front()
@@ -474,6 +553,86 @@ mod tests {
             max_requests: n,
             max_tokens: 1_000_000,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn estimate_follows_limits_and_backlog() {
+        // RPM 60: one request per second, whatever the cap.
+        let l = Limits {
+            rpm: Some(60),
+            ..limits(8)
+        };
+        let s = Scheduler::new("p", "k", l, bounds(100));
+        let e = s.estimate(30, 10);
+        assert!((e.rate - 1.0).abs() < 1e-9, "{e:?}");
+        assert_eq!(e.backlog, 0);
+        assert!((e.secs - 30.0).abs() < 1e-9);
+        assert_eq!(e.fits_in(12.0), 12);
+        // A request in flight is backlog.
+        let _p = s.acquire(Lane::Bulk, 10, false).await.unwrap();
+        let e = s.estimate(30, 10);
+        assert_eq!(e.backlog, 1);
+        assert!((e.secs - 31.0).abs() < 1e-9);
+        assert_eq!(e.fits_in(12.0), 11);
+        assert!((e.drain_secs() - 1.0).abs() < 1e-9);
+        // TPM lowers the rate for big requests: 6,000 tokens a minute at
+        // 1,000 each is 0.1 per second.
+        let l = Limits {
+            tpm: Some(6_000),
+            ..limits(8)
+        };
+        let s = Scheduler::new("p", "k", l, bounds(100));
+        let e = s.estimate(1, 1_000);
+        assert!((e.rate - 0.1).abs() < 1e-9, "{e:?}");
+        // No limits: the in-flight cap per second.
+        let s = Scheduler::new("p", "k", limits(4), bounds(100));
+        assert!((s.estimate(8, 1).secs - 2.0).abs() < 1e-9);
+        assert_eq!(s.estimate(8, 1).fits_in(0.5), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn estimate_keeps_rates_below_one_per_thousand_seconds() {
+        // TPM 6,000 at 200,000 tokens each: 0.0005 per second, so 3 items
+        // take 6,000 s. A floor at 0.001 per second would say 3,000 s.
+        let l = Limits {
+            tpm: Some(6_000),
+            ..limits(8)
+        };
+        let s = Scheduler::new("p", "k", l, bounds(100));
+        let e = s.estimate(3, 200_000);
+        assert!((e.rate - 0.0005).abs() < 1e-12, "{e:?}");
+        assert!((e.secs - 6_000.0).abs() < 1e-6, "{e:?}");
+        assert_eq!(e.fits_in(4_000.0 * 0.8), 1);
+        // The largest TPM and token count still give a positive rate.
+        let l = Limits {
+            tpm: Some(1),
+            ..limits(8)
+        };
+        let s = Scheduler::new("p", "k", l, bounds(100));
+        let e = s.estimate(1, u64::MAX);
+        assert!(e.rate > 0.0 && e.secs.is_finite(), "{e:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn limits_cap_the_observed_rate_of_a_warm_scheduler() {
+        // Many small requests finished fast: the observed rate is high, but
+        // 1,000-token requests under TPM 6,000 still go at 0.1 per second.
+        let l = Limits {
+            tpm: Some(6_000),
+            rpm: Some(600),
+            ..limits(8)
+        };
+        let s = Scheduler::new("p", "k", l, bounds(100));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            let p = s.acquire(Lane::Bulk, 1, false).await.unwrap();
+            p.finish(Verdict::Success, &RateHint::default());
+        }
+        let e = s.estimate(1, 1_000);
+        assert!((e.rate - 0.1).abs() < 1e-9, "{e:?}");
+        // RPM 600 caps small requests at 10 per second.
+        let e = s.estimate(1, 1);
+        assert!(e.rate <= 10.0 + 1e-9, "{e:?}");
     }
 
     #[tokio::test(start_paused = true)]

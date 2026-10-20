@@ -27,9 +27,9 @@ use crate::secrets::{ApiKey, KeyResolver, Secret};
 mod auth;
 mod cache;
 mod decode;
-mod ingress;
-mod models;
-mod raw;
+pub(crate) mod ingress;
+pub(crate) mod models;
+pub(crate) mod raw;
 mod routes;
 mod status;
 

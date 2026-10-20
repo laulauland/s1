@@ -3,13 +3,14 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use serde_json::{Value, json};
@@ -33,12 +34,32 @@ pub struct Seen {
     pub path: String,
     pub headers: HeaderMap,
     pub body: Bytes,
+    /// The body length, kept when the body is dropped.
+    pub body_len: usize,
 }
 
+/// The requests a mock received. With [`Recorder::drop_bodies`] it keeps
+/// only body lengths, so memory tests do not count the mock's copies.
 #[derive(Clone, Default)]
-pub struct Recorder(Arc<Mutex<Vec<Seen>>>);
+pub struct Recorder(Arc<Mutex<Vec<Seen>>>, Arc<AtomicBool>);
 
 impl Recorder {
+    pub fn drop_bodies(&self) {
+        self.1.store(true, Ordering::Relaxed);
+    }
+    fn push(&self, mut seen: Seen) {
+        if self.1.load(Ordering::Relaxed) {
+            seen.body = Bytes::new();
+            // Header values share the connection read buffer (up to about
+            // 400 KiB); keeping them would keep that buffer. Copy them.
+            seen.headers = seen
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), HeaderValue::from_bytes(v.as_bytes()).unwrap()))
+                .collect();
+        }
+        self.0.lock().unwrap().push(seen);
+    }
     pub fn all(&self) -> Vec<Seen> {
         self.0.lock().unwrap().clone()
     }
@@ -61,10 +82,11 @@ async fn systemone(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    rec.0.lock().unwrap().push(Seen {
+    rec.push(Seen {
         path: "/v1/systemone".into(),
         headers: headers.clone(),
         body: body.clone(),
+        body_len: body.len(),
     });
     let auth = headers
         .get("authorization")
@@ -218,10 +240,11 @@ async fn workers_ai_run(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    rec.0.lock().unwrap().push(Seen {
+    rec.push(Seen {
         path: format!("/accounts/{account}/ai/run/{model}"),
         headers: headers.clone(),
         body: body.clone(),
+        body_len: body.len(),
     });
     let authorized = headers.get("authorization").and_then(|v| v.to_str().ok())
         == Some(&format!("Bearer {CF_TOKEN}"));
@@ -370,10 +393,11 @@ async fn openai_decisions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    rec.0.lock().unwrap().push(Seen {
+    rec.push(Seen {
         path: "/v1/decisions".into(),
         headers: headers.clone(),
         body: body.clone(),
+        body_len: body.len(),
     });
     let authorized = headers.get("authorization").and_then(|v| v.to_str().ok())
         == Some(&format!("Bearer {OPENAI_KEY}"));
