@@ -18,6 +18,7 @@ use super::stream::{self, Job, Keep, SendFn, StateMode, StreamOpts};
 use crate::flatten::validate_names;
 use crate::paths::Paths;
 use crate::protocol::{self, Protocol, ProtocolId};
+use crate::queue::{LANE_HEADER, Lane};
 
 /// Alias used when neither the template nor `-m` names a model.
 pub const DEFAULT_MODEL: &str = "decide";
@@ -53,9 +54,13 @@ pub struct DecideArgs {
     /// Write results in completion order, not input order.
     #[arg(long)]
     pub unordered: bool,
-    /// Most requests in flight at once in streaming mode.
-    #[arg(short = 'j', long, default_value_t = 16)]
-    pub max_in_flight: usize,
+    /// Most requests in flight at once in streaming mode (default: follow
+    /// the backend's current cap).
+    #[arg(short = 'j', long)]
+    pub max_in_flight: Option<usize>,
+    /// Skip the cache lookup (the fresh answer is still stored).
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
 /// Endpoint for a Decide format.
@@ -104,12 +109,18 @@ pub fn parse_template(
     Ok((t, names))
 }
 
-fn json_headers() -> HeaderMap {
+fn json_headers(no_cache: bool, lane: Lane) -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
+    if no_cache {
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    }
+    if lane == Lane::Bulk {
+        h.insert(LANE_HEADER, HeaderValue::from_static("bulk"));
+    }
     h
 }
 
@@ -132,7 +143,7 @@ pub fn run(args: DecideArgs, paths: &Paths) -> Result<ExitCode, String> {
         &paths.socket,
         Method::POST,
         endpoint(pid),
-        json_headers(),
+        json_headers(args.no_cache, Lane::Interactive),
         Bytes::from(serde_json::to_vec(&Value::Object(body)).expect("JSON")),
     ))?;
     let mut out = std::io::stdout().lock();
@@ -189,9 +200,19 @@ fn run_stream(
     ensure_daemon(paths)?;
     let socket = paths.socket.clone();
     let path = endpoint(pid);
-    let send: SendFn = Arc::new(move |body: Bytes| {
+    let no_cache = args.no_cache;
+    let send: SendFn = Arc::new(move |body: Bytes, lane: Lane| {
         let socket = socket.clone();
-        Box::pin(async move { request(&socket, Method::POST, path, json_headers(), body).await })
+        Box::pin(async move {
+            request(
+                &socket,
+                Method::POST,
+                path,
+                json_headers(no_cache, lane),
+                body,
+            )
+            .await
+        })
     });
     let outcome = super::runtime()?.block_on(async {
         let stdin = tokio::io::BufReader::new(tokio::io::stdin());

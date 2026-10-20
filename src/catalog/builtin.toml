@@ -89,3 +89,27 @@ spill = false
 [aliases.extract]
 models = ["workers-ai/clairic"]
 spill = false
+
+# Limits per provider (spec "Backpressure and rate limits"). PLACEHOLDERS:
+# replace them with your account's real limits in ~/.config/s1/models.toml.
+# Every field is optional; see `crate::limits::Limits` for all of them.
+[limits.typesafe]
+rpm = 600
+tpm = 2_000_000
+max_in_flight = 32
+adaptive = true
+
+# Workers AI text-generation default is 300 requests per minute (Clef and
+# Clairic buckets are not documented).
+[limits.workers-ai]
+rpm = 300
+tpm = 2_000_000
+max_in_flight = 16
+adaptive = true
+
+# gpt-6-luna "Build" tier defaults (Decisions-specific limits unknown).
+[limits.openai]
+rpm = 5_000
+tpm = 2_000_000
+max_in_flight = 32
+adaptive = true

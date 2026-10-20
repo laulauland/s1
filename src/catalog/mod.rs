@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use toml::Value;
 
+use crate::limits::Limits;
 use crate::protocol::{Family, ProtocolId};
 
 const BUILTIN: &str = include_str!("builtin.toml");
@@ -119,7 +120,7 @@ pub struct Catalog {
     pub providers: BTreeMap<String, Provider>,
     #[serde(default)]
     pub aliases: BTreeMap<String, Alias>,
-    /// Kept for stage 3 (limits); not read yet.
+    /// `[limits.<provider>]` tables; read with [`Catalog::limits_for`].
     #[serde(default)]
     pub limits: BTreeMap<String, Value>,
 }
@@ -220,6 +221,9 @@ impl Catalog {
                 }
             }
         }
+        for provider in self.limits.keys() {
+            self.limits_for(provider)?;
+        }
         for (alias, a) in &self.aliases {
             if a.models.is_empty() {
                 return Err(CatalogError::Invalid(format!(
@@ -235,6 +239,16 @@ impl Catalog {
             }
         }
         Ok(())
+    }
+
+    /// Limits for one provider: its `[limits.<provider>]` table over the
+    /// defaults ([`Limits::default`]).
+    pub fn limits_for(&self, provider: &str) -> Result<Limits, CatalogError> {
+        match self.limits.get(provider) {
+            None => Ok(Limits::default()),
+            Some(v) => Limits::from_toml(v)
+                .map_err(|e| CatalogError::Invalid(format!("[limits.{provider}]: {e}"))),
+        }
     }
 
     /// All models, sorted by `provider/model`.
@@ -464,6 +478,23 @@ mod tests {
             c.model("typesafe/jev-latest").is_some(),
             "provider model lists merge by id"
         );
+    }
+
+    #[test]
+    fn limits_come_from_the_catalog() {
+        let c = Catalog::builtin();
+        let ts = c.limits_for("typesafe").unwrap();
+        assert!(ts.rpm.is_some() && ts.tpm.is_some(), "placeholders are set");
+        let c = Catalog::with_overlay_str("[limits.typesafe]\nrpm = 5\n").unwrap();
+        assert_eq!(c.limits_for("typesafe").unwrap().rpm, Some(5));
+        assert_eq!(
+            c.limits_for("typesafe").unwrap().tpm,
+            ts.tpm,
+            "other built-in fields stay"
+        );
+        assert_eq!(c.limits_for("nobody").unwrap(), Limits::default());
+        let err = Catalog::with_overlay_str("[limits.typesafe]\nmax_in_flight = 0\n").unwrap_err();
+        assert!(err.to_string().contains("limits.typesafe"), "{err}");
     }
 
     #[test]

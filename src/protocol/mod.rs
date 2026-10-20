@@ -242,7 +242,9 @@ pub fn replace_model(body: &Bytes, model: &str) -> Result<Bytes, InspectError> {
 }
 
 /// Top-level members of a JSON object, in order, values unparsed.
-struct TopLevel<'a>(Vec<(std::borrow::Cow<'a, str>, &'a serde_json::value::RawValue)>);
+pub(crate) struct TopLevel<'a>(
+    pub(crate) Vec<(std::borrow::Cow<'a, str>, &'a serde_json::value::RawValue)>,
+);
 
 impl<'de: 'a, 'a> Deserialize<'de> for TopLevel<'a> {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {

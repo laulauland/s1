@@ -15,17 +15,22 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::backend::{BackendContext, Registry};
-use crate::catalog::Catalog;
+use crate::cache::{Cache, Versions};
+use crate::catalog::{Catalog, ModelRef};
 use crate::config::Config;
 use crate::images::Origin;
 use crate::paths::Paths;
-use crate::secrets::{KeyResolver, Secret};
+use crate::protect::Protection;
+use crate::queue::{Bounds, Scheduler};
+use crate::secrets::{ApiKey, KeyResolver, Secret};
 
 mod auth;
+mod cache;
 mod ingress;
 mod models;
 mod raw;
 mod routes;
+mod status;
 
 pub use routes::router;
 
@@ -35,17 +40,118 @@ pub struct AppState {
     pub catalog: Arc<Catalog>,
     pub backends: Registry,
     pub keys: KeyResolver,
+    /// Limits, queues, and breakers per backend and key.
+    pub protection: Arc<Protection>,
+    /// Response cache; `None` when disabled.
+    pub cache: Option<Arc<Cache>>,
+    /// Last resolved model versions (part of the cache key).
+    pub versions: Arc<Versions>,
 }
 
 impl AppState {
+    /// Default queue bounds, no cache, versions kept in memory.
     pub fn new(catalog: Catalog, keys: KeyResolver) -> Self {
         let ctx = BackendContext::new(keys.clone());
         let backends = Registry::from_catalog(&catalog, &ctx);
+        let protection = Arc::new(Protection::new(&catalog, Bounds::default()));
         Self {
             catalog: Arc::new(catalog),
             backends,
             keys,
+            protection,
+            cache: None,
+            versions: Arc::new(Versions::in_memory()),
         }
+    }
+
+    /// Replace the queue bounds (drops schedulers made so far).
+    pub fn with_bounds(mut self, bounds: Bounds) -> Self {
+        self.protection = Arc::new(Protection::new(&self.catalog, bounds));
+        self
+    }
+
+    pub fn with_cache(mut self, cache: Arc<Cache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    pub fn with_versions(mut self, versions: Versions) -> Self {
+        self.versions = Arc::new(versions);
+        self
+    }
+
+    /// State for the daemon: config sizes, the cache file, and the
+    /// persisted model versions.
+    pub fn from_config(
+        catalog: Catalog,
+        keys: KeyResolver,
+        config: &Config,
+        paths: &Paths,
+    ) -> Result<Self, DaemonError> {
+        let mut st = Self::new(catalog, keys)
+            .with_bounds(config.queue)
+            .with_versions(Versions::load(&paths.versions_file()));
+        if config.cache.enabled {
+            let cache = Cache::open(&paths.cache_file(), config.cache.max_bytes)
+                .map_err(|e| DaemonError::Setup(e.to_string()))?;
+            st = st.with_cache(Arc::new(cache));
+        }
+        Ok(st)
+    }
+
+    /// The `auth.json` entry of a provider.
+    fn auth_entry<'a>(&'a self, provider: &'a str) -> &'a str {
+        self.catalog
+            .providers
+            .get(provider)
+            .and_then(|p| p.auth.as_deref())
+            .unwrap_or(provider)
+    }
+
+    /// The scheduler of a provider and its resolved key, made on first use;
+    /// `None` if no key resolves.
+    pub(crate) fn guard(&self, provider: &str) -> Option<Arc<Scheduler>> {
+        self.guard_with_key(provider).map(|(g, _)| g)
+    }
+
+    /// The scheduler of a provider and the key it belongs to, resolved once.
+    /// Requests carry this key to the backend
+    /// ([`BackendRequest::credential`](crate::backend::BackendRequest)), so
+    /// a key that changes while they wait does not move them to another
+    /// key's limits.
+    pub(crate) fn guard_with_key(&self, provider: &str) -> Option<(Arc<Scheduler>, ApiKey)> {
+        let key = self
+            .keys
+            .resolve(self.auth_entry(provider))
+            .ok()
+            .flatten()?;
+        Some((self.protection.guard(provider, key.key.expose()), key))
+    }
+
+    /// The scheduler of a provider and its key, only if it already exists.
+    pub(crate) fn existing_guard(&self, provider: &str) -> Option<Arc<Scheduler>> {
+        let key = self
+            .keys
+            .resolve(self.auth_entry(provider))
+            .ok()
+            .flatten()?;
+        self.protection.existing(provider, key.key.expose())
+    }
+
+    /// Ok if the model can take a request now: a backend, a usable key, and
+    /// a closed breaker.
+    pub(crate) fn available(&self, m: &ModelRef<'_>) -> Result<(), crate::error::S1Error> {
+        self.backends.ready(&self.keys, m)?;
+        match self.existing_guard(m.provider_name) {
+            Some(g) => g.check_breaker(),
+            None => Ok(()),
+        }
+    }
+
+    /// True if a new request to the model would wait.
+    pub(crate) fn throttled(&self, m: &ModelRef<'_>) -> bool {
+        self.existing_guard(m.provider_name)
+            .is_some_and(|g| g.throttled())
     }
 }
 
@@ -305,11 +411,12 @@ pub async fn run(paths: Paths) -> Result<(), DaemonError> {
     let catalog =
         Catalog::load(&paths.models_file()).map_err(|e| DaemonError::Setup(e.to_string()))?;
     let models = catalog.models().count();
+    let state = AppState::from_config(catalog, keys, &config, &paths)?;
     let server = serve_with_info(
         ServerOptions {
             socket: paths.socket.clone(),
             tcp,
-            state: AppState::new(catalog, keys),
+            state,
             token,
         },
         &paths.daemon_file(),

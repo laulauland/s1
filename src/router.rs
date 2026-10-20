@@ -6,8 +6,10 @@
 //!   `too_long` or `unsupported`.
 //! - An alias resolves to an ordered list. The first entry that is available
 //!   and whose capabilities fit (context, images, option and level counts)
-//!   wins. Throttle-based spill comes with the limiters (stage 3), through the
-//!   `available` callback.
+//!   wins. An entry whose circuit breaker is open is unavailable. A
+//!   throttled entry (provider pause, queue, or no room under its limits)
+//!   is skipped only when the alias sets `spill = true`; if every fitting
+//!   entry is throttled, the first one takes the request and it queues.
 //! - Formats are not translated yet (stage 4): an entry must speak the
 //!   ingress format natively.
 
@@ -54,10 +56,13 @@ pub struct RequestFlags {
 pub struct Router<'a> {
     pub catalog: &'a Catalog,
     pub backends: &'a Registry,
-    /// Ok if the model can take a request now (backend and a usable key;
-    /// later also not throttled and breaker closed). The error says why not
-    /// and should be `backend_unavailable`.
+    /// Ok if the model can take a request now (backend, a usable key, and
+    /// a closed breaker). The error says why not; its code should be
+    /// `backend_unavailable`.
     pub available: &'a dyn Fn(&ModelRef<'_>) -> Result<(), S1Error>,
+    /// True if a request to the model would wait now. Used only for aliases
+    /// with `spill = true`.
+    pub throttled: &'a dyn Fn(&ModelRef<'_>) -> bool,
 }
 
 /// How strictly to estimate the input size.
@@ -145,14 +150,32 @@ impl Router<'_> {
         info: &RouteInfo,
         flags: RequestFlags,
     ) -> Result<Route, S1Error> {
+        let spill = self.catalog.aliases.get(alias).is_some_and(|a| a.spill);
         let mut first_misfit: Option<S1Error> = None;
+        let mut first_throttled: Option<&ModelRef<'_>> = None;
         let mut any_unavailable = false;
+        // Shortest breaker cool-down among unavailable entries, and whether
+        // every unavailable entry was skipped for an open breaker.
+        let mut breaker_wait: Option<u64> = None;
+        let mut all_breaker = true;
         let mut skipped = Vec::new();
         for m in entries {
             match self.check(ingress, m, info, flags, Estimate::High) {
+                Ok(()) if spill && (self.throttled)(m) => {
+                    first_throttled.get_or_insert(m);
+                }
                 Ok(()) => return self.finish(m),
                 Err(S1Error::WrongFamily(_)) => {}
-                Err(e @ S1Error::BackendUnavailable(_)) => {
+                Err(e) if e.code() == "backend_unavailable" => {
+                    match &e {
+                        S1Error::BreakerOpen {
+                            retry_after_secs, ..
+                        } => {
+                            let secs = *retry_after_secs;
+                            breaker_wait = Some(breaker_wait.map_or(secs, |w| w.min(secs)));
+                        }
+                        _ => all_breaker = false,
+                    }
                     any_unavailable = true;
                     skipped.push(format!("{}: {e}", m.id()));
                 }
@@ -162,11 +185,24 @@ impl Router<'_> {
                 }
             }
         }
+        // Every fitting entry is throttled: queue on the first.
+        if let Some(m) = first_throttled {
+            return self.finish(m);
+        }
         if any_unavailable {
-            return Err(S1Error::BackendUnavailable(format!(
+            let message = format!(
                 "no model of alias `{alias}` can take this request now ({})",
                 skipped.join("; ")
-            )));
+            );
+            // Every unavailable entry has an open breaker: tell the client
+            // when the first one cools down.
+            return Err(match breaker_wait.filter(|_| all_breaker) {
+                Some(retry_after_secs) => S1Error::BreakerOpen {
+                    message,
+                    retry_after_secs,
+                },
+                None => S1Error::BackendUnavailable(message),
+            });
         }
         // Every entry of the family is unfit: the request's problem, not an outage.
         Err(first_misfit.unwrap_or_else(|| {
@@ -341,6 +377,15 @@ mod tests {
         info: &RouteInfo,
         available: &dyn Fn(&ModelRef<'_>) -> bool,
     ) -> Result<Route, S1Error> {
+        route_full(c, info, available, &|_| false)
+    }
+
+    fn route_full(
+        c: &Catalog,
+        info: &RouteInfo,
+        available: &dyn Fn(&ModelRef<'_>) -> bool,
+        throttled: &dyn Fn(&ModelRef<'_>) -> bool,
+    ) -> Result<Route, S1Error> {
         let available = |m: &ModelRef<'_>| {
             if available(m) {
                 Ok(())
@@ -357,6 +402,7 @@ mod tests {
             catalog: c,
             backends: &reg,
             available: &available,
+            throttled,
         }
         .route(ProtocolId::Systemone, info, RequestFlags::default())
     }
@@ -620,5 +666,115 @@ mod tests {
             route_with(&c, &info("chain"), &no_cf).unwrap().model_id,
             "typesafe/jev-latest"
         );
+    }
+
+    #[test]
+    fn spill_skips_throttled_entries_only_when_the_alias_allows() {
+        let flash_throttled = |m: &ModelRef<'_>| m.model.id == "clef-flash";
+        let all = |_: &ModelRef<'_>| true;
+        // Default alias: spill = false, so the throttled first entry queues.
+        let c = Catalog::builtin();
+        let r = route_full(&c, &info("decide"), &all, &flash_throttled).unwrap();
+        assert_eq!(r.model_id, "workers-ai/clef-flash");
+        // spill = true: the next entry takes it.
+        let c = Catalog::with_overlay_str(
+            "[aliases.decide]\nmodels = [\"workers-ai/clef-flash\", \"typesafe/jev-latest\"]\nspill = true",
+        )
+        .unwrap();
+        let r = route_full(&c, &info("decide"), &all, &flash_throttled).unwrap();
+        assert_eq!(r.model_id, "typesafe/jev-latest");
+        // Every entry throttled: queue on the first.
+        let r = route_full(&c, &info("decide"), &all, &|_| true).unwrap();
+        assert_eq!(r.model_id, "workers-ai/clef-flash");
+        // A named model is never spilled.
+        let r = route_full(&c, &info("workers-ai/clef-flash"), &all, &|_| true).unwrap();
+        assert_eq!(r.model_id, "workers-ai/clef-flash");
+    }
+
+    #[test]
+    fn open_breaker_makes_an_entry_unavailable() {
+        let c = Catalog::builtin();
+        let reg = registry(&c);
+        let available = |m: &ModelRef<'_>| {
+            if m.provider_name == "workers-ai" {
+                Err(S1Error::BreakerOpen {
+                    message: "open".into(),
+                    retry_after_secs: 5,
+                })
+            } else {
+                Ok(())
+            }
+        };
+        let r = Router {
+            catalog: &c,
+            backends: &reg,
+            available: &available,
+            throttled: &|_| false,
+        };
+        let got = r
+            .route(
+                ProtocolId::Systemone,
+                &info("decide"),
+                RequestFlags::default(),
+            )
+            .unwrap();
+        assert_eq!(got.model_id, "typesafe/jev-latest");
+        let e = r
+            .route(
+                ProtocolId::Systemone,
+                &info("workers-ai/clef"),
+                RequestFlags::default(),
+            )
+            .unwrap_err();
+        assert_eq!(e.code(), "backend_unavailable");
+        assert_eq!(e.retry_after(), Some(5));
+    }
+
+    #[test]
+    fn alias_with_only_open_breakers_keeps_retry_after() {
+        let c = Catalog::with_overlay_str(
+            "[aliases.cf]\nmodels = [\"workers-ai/clef-flash\", \"workers-ai/clef\"]",
+        )
+        .unwrap();
+        let reg = registry(&c);
+        let run = |available: &dyn Fn(&ModelRef<'_>) -> Result<(), S1Error>, model: &str| {
+            Router {
+                catalog: &c,
+                backends: &reg,
+                available,
+                throttled: &|_| false,
+            }
+            .route(ProtocolId::Systemone, &info(model), RequestFlags::default())
+            .unwrap_err()
+        };
+        // Each entry has its own cool-down: the shortest one wins.
+        let breakers = |m: &ModelRef<'_>| {
+            Err(S1Error::BreakerOpen {
+                message: "open".into(),
+                retry_after_secs: if m.model.id == "clef-flash" { 9 } else { 4 },
+            })
+        };
+        let e = run(&breakers, "cf");
+        assert_eq!(e.code(), "backend_unavailable");
+        assert_eq!(e.status().as_u16(), 503);
+        assert_eq!(e.retry_after(), Some(4), "{e}");
+        // Default alias: clef-flash breaker open, typesafe also unavailable
+        // through its breaker.
+        let e = run(&breakers, "decide");
+        assert_eq!(e.retry_after(), Some(4), "{e}");
+        // One entry is down for another reason: no promise of a retry time.
+        let mixed = |m: &ModelRef<'_>| {
+            if m.model.id == "clef-flash" {
+                Err(S1Error::BreakerOpen {
+                    message: "open".into(),
+                    retry_after_secs: 9,
+                })
+            } else {
+                Err(S1Error::BackendUnavailable("no key".into()))
+            }
+        };
+        let e = run(&mixed, "cf");
+        assert_eq!(e.code(), "backend_unavailable");
+        assert_eq!(e.retry_after(), None, "{e}");
     }
 }

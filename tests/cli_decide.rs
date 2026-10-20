@@ -307,3 +307,70 @@ fn image_field_sends_paths_that_the_daemon_reads() {
     assert_eq!(asset["data_base64"], "iVBORw0KGgpyZXN0");
     assert!(asset.get("s1_path").is_none());
 }
+
+#[test]
+fn cache_status_and_cache_clear_commands() {
+    let env = Env::new();
+    let t = env.template("triage.json", triage());
+    let t = t.to_str().unwrap();
+    let first = env.ok(&["decide", "-t", t, "Checkout is down, yes"], b"");
+    let calls = env.mocks.clef.all().len();
+    let second = env.ok(&["decide", "-t", t, "Checkout is down, yes"], b"");
+    assert_eq!(first.stdout, second.stdout);
+    assert_eq!(
+        env.mocks.clef.all().len(),
+        calls,
+        "second answer from the cache"
+    );
+    env.ok(
+        &["decide", "-t", t, "--no-cache", "Checkout is down, yes"],
+        b"",
+    );
+    assert_eq!(
+        env.mocks.clef.all().len(),
+        calls + 1,
+        "--no-cache asks again"
+    );
+
+    let out = env.ok(&["status", "--json"], b"");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let providers: Vec<&str> = v["backends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["provider"].as_str().unwrap())
+        .collect();
+    assert!(
+        providers.contains(&"typesafe") && providers.contains(&"workers-ai"),
+        "{v}"
+    );
+    assert_eq!(v["cache"]["entries"], 1, "{v}");
+    let out = env.ok(&["status"], b"");
+    let table = text(&out.stdout);
+    assert!(
+        table.contains("BREAKER") && table.contains("workers-ai"),
+        "{table}"
+    );
+    assert!(!table.contains(CF_TOKEN) && !table.contains(TEST_KEY));
+
+    let out = env.ok(&["cache", "clear"], b"");
+    assert!(
+        text(&out.stdout).contains("cleared 1"),
+        "{}",
+        text(&out.stdout)
+    );
+    env.ok(&["decide", "-t", t, "Checkout is down, yes"], b"");
+    assert_eq!(env.mocks.clef.all().len(), calls + 2, "cleared: asks again");
+
+    // Without a daemon the file is removed.
+    env.ok(&["daemon", "stop"], b"");
+    let file = env.root().join("cache/s1/cache.redb");
+    assert!(file.exists());
+    let out = env.ok(&["cache", "clear"], b"");
+    assert!(
+        text(&out.stdout).contains("removed"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(!file.exists());
+}

@@ -221,6 +221,8 @@ async fn unreachable_provider_is_backend_unavailable() {
     assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
     let v: Value = serde_json::from_slice(&reply.body).unwrap();
     assert_eq!(v["detail"]["error_type"], "backend_unavailable");
+    // Connection errors are retried (stage 3): 4 attempts in all.
+    assert_eq!(reply.headers["s1-retries"], "3");
     h.server.shutdown().await;
 }
 

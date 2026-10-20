@@ -76,6 +76,14 @@ async fn live_raw_systemone_tiny_request() {
 async fn live_server(
     providers: &[&str],
 ) -> Option<(tempfile::TempDir, Paths, s1::daemon::RunningServer)> {
+    live_server_with(providers, false).await
+}
+
+/// As [`live_server`]; `cache` adds a response cache in the temp dir.
+async fn live_server_with(
+    providers: &[&str],
+    cache: bool,
+) -> Option<(tempfile::TempDir, Paths, s1::daemon::RunningServer)> {
     if std::env::var("S1_LIVE").as_deref() != Ok("1") {
         eprintln!("skip: S1_LIVE is not 1");
         return None;
@@ -106,10 +114,16 @@ async fn live_server(
         env.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone())
     });
     let token = keys.ensure_local_token().unwrap();
+    let mut state = AppState::new(Catalog::builtin(), keys)
+        .with_versions(s1::cache::Versions::load(&paths.versions_file()));
+    if cache {
+        let c = s1::cache::Cache::open(&paths.cache_file(), 1 << 20).unwrap();
+        state = state.with_cache(std::sync::Arc::new(c));
+    }
     let server = serve(ServerOptions {
         socket: paths.socket.clone(),
         tcp: "127.0.0.1:0".parse().unwrap(),
-        state: AppState::new(Catalog::builtin(), keys),
+        state,
         token,
     })
     .await
@@ -212,4 +226,63 @@ async fn live_systemone_clef_via_alias_and_too_long() {
     );
     let v: Value = serde_json::from_slice(&reply.body).unwrap();
     assert_eq!(v["detail"]["error_type"], "too_long");
+}
+
+/// Stage 3 through the real provider: the second identical request is a
+/// cache hit, the resolved version is saved, and `/status` shows the call.
+/// Prints the provider's rate-limit headers (values are not secrets) to
+/// help set real limits.
+#[tokio::test]
+#[ignore = "live: needs S1_LIVE=1 and a TypeSafe key"]
+async fn live_protection_cache_and_status() {
+    let Some((_dir, paths, server)) = live_server_with(&["typesafe"], true).await else {
+        return;
+    };
+    let body = br#"{"model":"typesafe/jev-latest","state":"I was charged twice.","questions":{"billing":{"type":"noul","instructions":"Is this message about billing?"}}}"#;
+    let first = post_systemone(&paths, body).await;
+    assert_eq!(
+        first.status.as_u16(),
+        200,
+        "{}",
+        String::from_utf8_lossy(&first.body)
+    );
+    assert_eq!(first.headers["s1-cache"], "miss");
+    assert!(first.headers.contains_key("s1-capacity"));
+    for (k, v) in &first.headers {
+        let name = k.as_str();
+        if name.contains("ratelimit") || name.contains("retry") {
+            eprintln!("provider header {name}: {}", v.to_str().unwrap_or("?"));
+        }
+    }
+    let second = post_systemone(&paths, body).await;
+    assert_eq!(second.headers["s1-cache"], "hit");
+    assert_eq!(second.body, first.body);
+
+    let resolved: Value = serde_json::from_slice(&first.body).unwrap();
+    let versions: Value =
+        serde_json::from_slice(&std::fs::read(paths.versions_file()).unwrap()).unwrap();
+    assert_eq!(versions["typesafe/jev-latest"], resolved["model"]);
+    eprintln!("resolved version: {}", resolved["model"]);
+
+    let status = request(
+        &paths.socket,
+        Method::GET,
+        "/status",
+        HeaderMap::new(),
+        Bytes::new(),
+    )
+    .await
+    .unwrap();
+    server.shutdown().await;
+    let s: Value = serde_json::from_slice(&status.body).unwrap();
+    let ts = s["backends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["provider"] == "typesafe")
+        .cloned()
+        .unwrap();
+    assert_eq!(ts["rate"]["requests_last_minute"], 1, "{ts}");
+    assert_eq!(ts["breaker"]["state"], "closed");
+    assert_eq!(s["cache"]["entries"], 1);
 }

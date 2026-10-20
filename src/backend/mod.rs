@@ -28,6 +28,10 @@ pub struct BackendRequest {
     /// Client headers the provider should see (content type, encoding,
     /// provider opt-in headers). Never the client's `Authorization`.
     pub headers: HeaderMap,
+    /// The key resolved when the request was queued; its scheduler belongs
+    /// to this key, so the request is sent with it even if the key changes
+    /// while it waits. `None`: the backend resolves the key at send time.
+    pub credential: Option<ApiKey>,
 }
 
 /// The provider's answer, unchanged.
@@ -96,8 +100,17 @@ impl BackendContext {
         Self { http, keys }
     }
 
-    /// Resolve a key or fail with `backend_unavailable`.
-    pub fn key(&self, provider: &str, auth_entry: &str) -> Result<ApiKey, S1Error> {
+    /// The key for `req`: the snapshot it carries, else a fresh lookup
+    /// (failing with `backend_unavailable`).
+    pub fn credential(
+        &self,
+        req: &BackendRequest,
+        provider: &str,
+        auth_entry: &str,
+    ) -> Result<ApiKey, S1Error> {
+        if let Some(k) = &req.credential {
+            return Ok(k.clone());
+        }
         match self.keys.resolve(auth_entry) {
             Ok(Some(k)) => Ok(k),
             Ok(None) => Err(S1Error::BackendUnavailable(format!(

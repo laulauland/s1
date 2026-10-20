@@ -1,10 +1,14 @@
-//! `~/.config/s1/config.toml`: listeners and log level. Later stages add
-//! queue and cache sizes. Unknown keys are ignored.
+//! `~/.config/s1/config.toml`: listeners, queue sizes, cache size, and log
+//! level. Unknown top-level keys are ignored; unknown keys inside `[queue]`
+//! and `[cache]` are errors.
 
 use std::net::SocketAddr;
 use std::path::Path;
 
 use serde::Deserialize;
+
+use crate::cache::CacheConfig;
+use crate::queue::Bounds;
 
 /// Default TCP listener.
 pub const DEFAULT_TCP: &str = "127.0.0.1:7341";
@@ -14,6 +18,9 @@ pub const DEFAULT_TCP: &str = "127.0.0.1:7341";
 pub struct Config {
     pub listen: Listen,
     pub log_level: String,
+    /// Queue bounds per backend and key.
+    pub queue: Bounds,
+    pub cache: CacheConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -28,6 +35,8 @@ impl Default for Config {
         Self {
             listen: Listen::default(),
             log_level: "info".into(),
+            queue: Bounds::default(),
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -98,6 +107,22 @@ mod tests {
         let c = Config::parse("").unwrap();
         assert_eq!(c.tcp_addr().unwrap().to_string(), DEFAULT_TCP);
         assert_eq!(c.log_level, "info");
+        assert_eq!(c.queue, Bounds::default());
+        assert!(c.cache.enabled);
+        assert_eq!(c.cache.max_bytes, 1 << 30);
+    }
+
+    #[test]
+    fn reads_queue_and_cache_sizes() {
+        let c = Config::parse(
+            "[queue]\nmax_requests = 10\nmax_tokens = 5000\n[cache]\nenabled = false\nmax_bytes = 1024",
+        )
+        .unwrap();
+        assert_eq!(c.queue.max_requests, 10);
+        assert_eq!(c.queue.max_tokens, 5000);
+        assert!(!c.cache.enabled);
+        assert_eq!(c.cache.max_bytes, 1024);
+        assert!(Config::parse("[queue]\nnope = 1").is_err());
     }
 
     #[test]

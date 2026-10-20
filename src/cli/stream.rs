@@ -5,11 +5,15 @@
 //! (for `--flat`), and how the state is placed, so `s1 extract` (stage 5)
 //! reuses this engine.
 //!
-//! The window (`-j`) counts requests in flight and replies held back for
-//! an earlier line (ordered output). Stdin is read only when the window
-//! has room, so a full window or one slow line blocks the producer of the
-//! pipe. Each reply is written as soon as it can be, also while stdin
-//! stays open.
+//! Window: the first [`INTERACTIVE_FIRST`] requests go in the interactive
+//! lane, the rest in the bulk lane. The window starts at
+//! [`INITIAL_WINDOW`] and then follows the backend's current in-flight cap
+//! (the `s1-capacity` reply header), never above `-j` when given. Stdin is
+//! read only when the window has room, so a full window blocks the
+//! producer of the pipe. The window counts requests in flight and replies
+//! held back for an earlier line (ordered output), so one slow line also
+//! stops stdin reads. Each reply is written as soon as it can be, also
+//! while stdin stays open.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -26,6 +30,16 @@ use super::client::Reply;
 use crate::flatten::is_column_of;
 use crate::images::path_asset;
 use crate::protocol::Protocol;
+use crate::queue::Lane;
+
+/// Requests sent in the interactive lane before the rest go in bulk.
+pub const INTERACTIVE_FIRST: usize = 4;
+/// Window before the first reply tells the backend's cap.
+pub const INITIAL_WINDOW: usize = 4;
+/// Largest window when `-j` is not given.
+pub const MAX_WINDOW: usize = 256;
+/// Reply header with the backend's current in-flight cap.
+pub const CAPACITY_HEADER: &str = "s1-capacity";
 
 /// What the output carries besides the id and the answers.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -70,7 +84,8 @@ pub struct StreamOpts {
     pub keep: Keep,
     pub unordered: bool,
     pub flat: bool,
-    pub max_in_flight: usize,
+    /// Upper bound of the window (`-j`); `None`: follow the backend's cap.
+    pub max_in_flight: Option<usize>,
 }
 
 impl Default for StreamOpts {
@@ -82,7 +97,7 @@ impl Default for StreamOpts {
             keep: Keep::Nothing,
             unordered: false,
             flat: false,
-            max_in_flight: 16,
+            max_in_flight: None,
         }
     }
 }
@@ -97,9 +112,42 @@ pub struct Job {
     pub answer_names: Vec<String>,
 }
 
-/// Sends one request body to the daemon.
-pub type SendFn =
-    Arc<dyn Fn(Bytes) -> Pin<Box<dyn Future<Output = Result<Reply, String>> + Send>> + Send + Sync>;
+/// Sends one request body to the daemon in a lane.
+pub type SendFn = Arc<
+    dyn Fn(Bytes, Lane) -> Pin<Box<dyn Future<Output = Result<Reply, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The window of requests in flight.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    size: usize,
+    limit: usize,
+}
+
+impl Window {
+    fn new(limit: Option<usize>) -> Self {
+        let limit = limit.unwrap_or(MAX_WINDOW).max(1);
+        Self {
+            size: INITIAL_WINDOW.min(limit),
+            limit,
+        }
+    }
+
+    /// Follow the cap a reply reports.
+    fn observe(&mut self, res: &Result<Reply, String>) {
+        let cap = res
+            .as_ref()
+            .ok()
+            .and_then(|r| r.headers.get(CAPACITY_HEADER))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        if let Some(cap) = cap {
+            self.size = cap.clamp(1, self.limit);
+        }
+    }
+}
 
 /// Result of a whole stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -140,8 +188,9 @@ where
         outcome: Outcome::default(),
     };
     let mut seq = 0usize;
+    let mut sent = 0usize;
     let mut fatal = None;
-    let window = opts.max_in_flight.max(1);
+    let mut window = Window::new(opts.max_in_flight);
     let mut eof = false;
 
     // Write each reply as soon as it arrives; read stdin only while the
@@ -149,11 +198,12 @@ where
     // earlier line count against the window too, so a stalled head line
     // stops stdin reads (and the pipe blocks the producer).
     loop {
-        let room = set.len() + writer.pending.len() < window;
+        let room = set.len() + writer.pending.len() < window.size;
         tokio::select! {
             biased;
             Some(done) = set.join_next(), if !set.is_empty() => {
                 let (ctx, res) = done.map_err(|e| format!("request task failed: {e}"))?;
+                window.observe(&res);
                 let (text, ok) = finish(&ctx, res, &job, opts);
                 writer.push(ctx.seq, text, ok).await?;
             }
@@ -169,8 +219,14 @@ where
                 seq += 1;
                 match prepare(&line, n, &job, opts) {
                     Prepared::Send(ctx, body) => {
+                        let lane = if sent < INTERACTIVE_FIRST {
+                            Lane::Interactive
+                        } else {
+                            Lane::Bulk
+                        };
+                        sent += 1;
                         let send = send.clone();
-                        set.spawn(async move { (ctx, send(body).await) });
+                        set.spawn(async move { (ctx, send(body, lane).await) });
                     }
                     Prepared::Failed(ctx, error) => {
                         let text = error_line(&ctx, error, opts);
@@ -508,7 +564,7 @@ mod tests {
     /// A fake daemon: answers from the state; `fail` in the state gives 413;
     /// `sleep:N` delays N ms.
     fn fake_send(seen: Arc<std::sync::Mutex<Vec<Value>>>) -> SendFn {
-        Arc::new(move |body: Bytes| {
+        Arc::new(move |body: Bytes, _lane: Lane| {
             let seen = seen.clone();
             Box::pin(async move {
                 let req: Value = serde_json::from_slice(&body).unwrap();
@@ -714,7 +770,7 @@ mod tests {
             state_field: Some("body".into()),
             image_field: Some("photo".into()),
             // One at a time, so `sent` is in input order.
-            max_in_flight: 1,
+            max_in_flight: Some(1),
             ..Default::default()
         };
         let input = format!(
@@ -801,7 +857,7 @@ mod tests {
             let opts = StreamOpts {
                 state_field: Some("body".into()),
                 unordered,
-                max_in_flight: window,
+                max_in_flight: Some(window),
                 flat: true,
                 ..Default::default()
             };
@@ -829,10 +885,160 @@ mod tests {
         }
     }
 
+    /// A daemon that reports cap `cap`, records lanes and concurrency, and
+    /// answers after `ms`.
+    #[derive(Default)]
+    struct Probe {
+        in_flight: usize,
+        /// In flight when each call started (including itself), and its lane.
+        starts: Vec<(usize, Lane)>,
+    }
+
+    fn probe_send(probe: Arc<std::sync::Mutex<Probe>>, cap: u32, ms: u64) -> SendFn {
+        Arc::new(move |_body: Bytes, lane: Lane| {
+            let probe = probe.clone();
+            Box::pin(async move {
+                {
+                    let mut p = probe.lock().unwrap();
+                    p.in_flight += 1;
+                    let n = p.in_flight;
+                    p.starts.push((n, lane));
+                }
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                probe.lock().unwrap().in_flight -= 1;
+                let mut headers = HeaderMap::new();
+                headers.insert(CAPACITY_HEADER, cap.to_string().parse().unwrap());
+                let body = json!({"model": "m", "answers": {
+                    "urgent": {"type": "noul", "noul": 0.5},
+                    "topic": {"type": "choice", "choice": "billing", "confidence": 0.5, "probabilities": {"billing": 0.5, "tech": 0.5}}
+                }});
+                Ok(Reply {
+                    status: StatusCode::OK,
+                    headers,
+                    body: Bytes::from(body.to_string()),
+                })
+            })
+        })
+    }
+
     fn lines(n: usize) -> String {
         (0..n)
             .map(|i| format!("{}\n", json!({"id": i, "body": "x"})))
             .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn window_follows_the_backend_cap_and_lanes_switch_to_bulk() {
+        let probe = Arc::new(std::sync::Mutex::new(Probe::default()));
+        let opts = StreamOpts {
+            state_field: Some("body".into()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let res = run(
+            lines(20).as_bytes(),
+            &mut out,
+            job(),
+            &opts,
+            probe_send(probe.clone(), 2, 10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.lines, 20);
+        let p = probe.lock().unwrap();
+        // Before any reply: the initial window.
+        assert!(
+            p.starts[..INITIAL_WINDOW]
+                .iter()
+                .all(|(n, _)| *n <= INITIAL_WINDOW)
+        );
+        // After the first reply reported cap 2, never more than 2.
+        assert!(
+            p.starts[INITIAL_WINDOW..].iter().all(|(n, _)| *n <= 2),
+            "{:?}",
+            p.starts
+        );
+        let lanes: Vec<Lane> = p.starts.iter().map(|(_, l)| *l).collect();
+        assert!(
+            lanes[..INTERACTIVE_FIRST]
+                .iter()
+                .all(|l| *l == Lane::Interactive)
+        );
+        assert!(lanes[INTERACTIVE_FIRST..].iter().all(|l| *l == Lane::Bulk));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn j_caps_the_window_below_the_backend_cap() {
+        let probe = Arc::new(std::sync::Mutex::new(Probe::default()));
+        let opts = StreamOpts {
+            state_field: Some("body".into()),
+            max_in_flight: Some(3),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        run(
+            lines(30).as_bytes(),
+            &mut out,
+            job(),
+            &opts,
+            probe_send(probe.clone(), 50, 10),
+        )
+        .await
+        .unwrap();
+        let p = probe.lock().unwrap();
+        let max = p.starts.iter().map(|(n, _)| *n).max().unwrap();
+        assert_eq!(max, 3, "cap 50 reported, -j 3 wins");
+    }
+
+    #[tokio::test]
+    async fn a_full_window_stops_reading_stdin() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let send: SendFn = {
+            let (gate, calls) = (gate.clone(), calls.clone());
+            Arc::new(move |_body: Bytes, _lane: Lane| {
+                let (gate, calls) = (gate.clone(), calls.clone());
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _p = gate.acquire().await.unwrap();
+                    Ok(Reply {
+                        status: StatusCode::OK,
+                        headers: HeaderMap::new(),
+                        body: Bytes::from_static(br#"{"answers":{}}"#),
+                    })
+                })
+            })
+        };
+        // A small pipe: the producer blocks once the reader stops.
+        let (mut producer, consumer) = tokio::io::duplex(256);
+        let input = lines(500);
+        let writer = tokio::spawn(async move {
+            producer.write_all(input.as_bytes()).await.unwrap();
+        });
+        let opts = StreamOpts {
+            state_field: Some("body".into()),
+            max_in_flight: Some(2),
+            ..Default::default()
+        };
+        let runner = tokio::spawn(async move {
+            let mut out = Vec::new();
+            run(
+                tokio::io::BufReader::new(consumer),
+                &mut out,
+                job(),
+                &opts,
+                send,
+            )
+            .await
+            .map(|o| o.lines)
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!writer.is_finished(), "the producer is blocked by the pipe");
+        gate.add_permits(10_000);
+        writer.await.unwrap();
+        assert_eq!(runner.await.unwrap().unwrap(), 500);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 500);
     }
 
     /// Answers every request at once except request #0, which waits for
@@ -841,7 +1047,7 @@ mod tests {
         head: Arc<tokio::sync::Semaphore>,
         calls: Arc<std::sync::atomic::AtomicUsize>,
     ) -> SendFn {
-        Arc::new(move |_body: Bytes| {
+        Arc::new(move |_body: Bytes, _lane: Lane| {
             let (head, calls) = (head.clone(), calls.clone());
             Box::pin(async move {
                 let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -869,7 +1075,7 @@ mod tests {
         });
         let opts = StreamOpts {
             state_field: Some("body".into()),
-            max_in_flight: 2,
+            max_in_flight: Some(2),
             ..Default::default()
         };
         let runner = tokio::spawn(async move {
@@ -903,46 +1109,6 @@ mod tests {
             })
             .collect();
         assert!(ids.iter().copied().eq(0..20_000), "ordered output");
-    }
-
-    #[tokio::test]
-    async fn local_error_lines_count_against_the_window() {
-        // Line 0 stalls; the rest are invalid lines. Held error lines fill
-        // the window, so stdin reads stop.
-        let head = Arc::new(tokio::sync::Semaphore::new(0));
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let send = stalled_head_send(head.clone(), calls.clone());
-        let (mut producer, consumer) = tokio::io::duplex(256);
-        let input = format!(
-            "{}\n{}",
-            json!({"id": 0, "body": "x"}),
-            "not json\n".repeat(20_000)
-        );
-        let writer = tokio::spawn(async move {
-            producer.write_all(input.as_bytes()).await.unwrap();
-        });
-        let opts = StreamOpts {
-            state_field: Some("body".into()),
-            max_in_flight: 4,
-            ..Default::default()
-        };
-        let runner = tokio::spawn(async move {
-            let mut out = Vec::new();
-            run(
-                tokio::io::BufReader::new(consumer),
-                &mut out,
-                job(),
-                &opts,
-                send,
-            )
-            .await
-            .map(|o| o.lines)
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(!writer.is_finished(), "the producer is blocked by the pipe");
-        head.add_permits(1);
-        writer.await.unwrap();
-        assert_eq!(runner.await.unwrap().unwrap(), 20_001);
     }
 
     #[tokio::test]
@@ -984,5 +1150,45 @@ mod tests {
         }
         drop(producer);
         assert_eq!(runner.await.unwrap().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn local_error_lines_count_against_the_window() {
+        // Line 0 stalls; the rest are invalid lines. Held error lines fill
+        // the window, so stdin reads stop.
+        let head = Arc::new(tokio::sync::Semaphore::new(0));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let send = stalled_head_send(head.clone(), calls.clone());
+        let (mut producer, consumer) = tokio::io::duplex(256);
+        let input = format!(
+            "{}\n{}",
+            json!({"id": 0, "body": "x"}),
+            "not json\n".repeat(20_000)
+        );
+        let writer = tokio::spawn(async move {
+            producer.write_all(input.as_bytes()).await.unwrap();
+        });
+        let opts = StreamOpts {
+            state_field: Some("body".into()),
+            max_in_flight: Some(4),
+            ..Default::default()
+        };
+        let runner = tokio::spawn(async move {
+            let mut out = Vec::new();
+            run(
+                tokio::io::BufReader::new(consumer),
+                &mut out,
+                job(),
+                &opts,
+                send,
+            )
+            .await
+            .map(|o| o.lines)
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!writer.is_finished(), "the producer is blocked by the pipe");
+        head.add_permits(1);
+        writer.await.unwrap();
+        assert_eq!(runner.await.unwrap().unwrap(), 20_001);
     }
 }

@@ -4,7 +4,7 @@
 //! | --- | --- | --- |
 //! | auth file | `~/.s1/auth.json` | `S1_HOME` |
 //! | config dir | `~/.config/s1` | `XDG_CONFIG_HOME` |
-//! | state dir (logs, pid) | `~/.local/state/s1` | `XDG_STATE_HOME` |
+//! | state dir (logs, pid, model versions) | `~/.local/state/s1` | `XDG_STATE_HOME` |
 //! | cache dir | `~/.cache/s1` | `XDG_CACHE_HOME` |
 //! | socket | `$XDG_RUNTIME_DIR/s1.sock` | `S1_SOCKET`; falls back to the state dir |
 
@@ -73,6 +73,14 @@ impl Paths {
     }
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join("config.toml")
+    }
+    /// The response cache store.
+    pub fn cache_file(&self) -> PathBuf {
+        self.cache_dir.join("cache.redb")
+    }
+    /// Last resolved model version per model id.
+    pub fn versions_file(&self) -> PathBuf {
+        self.state_dir.join("versions.json")
     }
     pub fn log_dir(&self) -> PathBuf {
         self.state_dir.clone()

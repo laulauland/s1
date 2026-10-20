@@ -24,6 +24,17 @@ pub enum S1Error {
     /// No backend can take the request now (503).
     #[error("{0}")]
     BackendUnavailable(String),
+    /// The provider could not be reached or dropped the connection (503,
+    /// code `backend_unavailable`). Retried, and counts toward the breaker.
+    #[error("{0}")]
+    Unreachable(String),
+    /// The backend's circuit breaker is open (503, code
+    /// `backend_unavailable`, with `Retry-After` until the cool-down ends).
+    #[error("{message}")]
+    BreakerOpen {
+        message: String,
+        retry_after_secs: u64,
+    },
     /// The request body cannot be read (400).
     #[error("{0}")]
     InvalidRequest(String),
@@ -37,7 +48,9 @@ impl S1Error {
             S1Error::TooLong(_) => "too_long",
             S1Error::Unsupported(_) => "unsupported",
             S1Error::WrongFamily(_) => "wrong_family",
-            S1Error::BackendUnavailable(_) => "backend_unavailable",
+            S1Error::BackendUnavailable(_)
+            | S1Error::Unreachable(_)
+            | S1Error::BreakerOpen { .. } => "backend_unavailable",
             S1Error::InvalidRequest(_) => "invalid_request",
         }
     }
@@ -48,7 +61,9 @@ impl S1Error {
             S1Error::TooLong(_) => StatusCode::PAYLOAD_TOO_LARGE,
             S1Error::Unsupported(_) => StatusCode::UNPROCESSABLE_ENTITY,
             S1Error::WrongFamily(_) => StatusCode::BAD_REQUEST,
-            S1Error::BackendUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            S1Error::BackendUnavailable(_)
+            | S1Error::Unreachable(_)
+            | S1Error::BreakerOpen { .. } => StatusCode::SERVICE_UNAVAILABLE,
             S1Error::InvalidRequest(_) => StatusCode::BAD_REQUEST,
         }
     }
@@ -57,6 +72,9 @@ impl S1Error {
     pub fn retry_after(&self) -> Option<u64> {
         match self {
             S1Error::QueueFull {
+                retry_after_secs, ..
+            }
+            | S1Error::BreakerOpen {
                 retry_after_secs, ..
             } => Some(*retry_after_secs),
             _ => None,
@@ -91,6 +109,19 @@ mod tests {
                 S1Error::InvalidRequest(String::new()),
                 "invalid_request",
                 400,
+            ),
+            (
+                S1Error::Unreachable(String::new()),
+                "backend_unavailable",
+                503,
+            ),
+            (
+                S1Error::BreakerOpen {
+                    message: String::new(),
+                    retry_after_secs: 3,
+                },
+                "backend_unavailable",
+                503,
             ),
         ];
         for (err, code, status) in cases {

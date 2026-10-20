@@ -234,7 +234,7 @@ impl Backend for WorkersAi {
     /// `model` to the upstream id, which is the selector).
     async fn call(&self, req: BackendRequest) -> Result<ProviderResponse, S1Error> {
         let auth_entry = self.provider.auth.as_deref().unwrap_or(&self.name);
-        let key = self.ctx.key(&self.name, auth_entry)?;
+        let key = self.ctx.credential(&req, &self.name, auth_entry)?;
         let account = self.account_id(&key)?;
         let (path_id, _) = model_ids(&req.upstream_model);
 
@@ -253,18 +253,14 @@ impl Backend for WorkersAi {
             .send()
             .await
             .map_err(|e| {
-                S1Error::BackendUnavailable(format!(
-                    "cannot reach {}: {}",
-                    self.name,
-                    e.without_url()
-                ))
+                S1Error::Unreachable(format!("cannot reach {}: {}", self.name, e.without_url()))
             })?;
         let status =
             StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let mut out_headers = HeaderMap::new();
         copy_headers(resp.headers(), &mut out_headers, forward_response_header);
         let body = resp.bytes().await.map_err(|e| {
-            S1Error::BackendUnavailable(format!(
+            S1Error::Unreachable(format!(
                 "{} closed the response early: {}",
                 self.name,
                 e.without_url()

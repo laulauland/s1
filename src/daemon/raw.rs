@@ -2,7 +2,9 @@
 //!
 //! The original request bytes go to the provider unchanged, and the provider
 //! response comes back unchanged, plus `s1-backend`, `s1-model`, and
-//! `s1-request-id` headers. No routing by alias, no queues (later stages).
+//! `s1-request-id` headers. No routing by alias and no cache, but the
+//! request goes through the provider's queue, limits, retries, and breaker
+//! like any other (lane from `s1-lane`).
 
 use std::time::Instant;
 
@@ -18,7 +20,9 @@ use serde::Deserialize;
 use super::{AppState, request_id};
 use crate::backend::BackendRequest;
 use crate::error::S1Error;
+use crate::protect::{self, CallStats};
 use crate::protocol::{self, ProtocolId};
+use crate::queue::Lane;
 
 /// Largest body accepted (TypeSafe allows 32 MiB).
 pub const MAX_BODY: usize = 64 * 1024 * 1024;
@@ -26,6 +30,10 @@ pub const MAX_BODY: usize = 64 * 1024 * 1024;
 pub const H_BACKEND: &str = "s1-backend";
 pub const H_MODEL: &str = "s1-model";
 pub const H_REQUEST_ID: &str = "s1-request-id";
+/// The backend's current in-flight cap (the CLI sizes its window to it).
+pub const H_CAPACITY: &str = "s1-capacity";
+/// Attempts after the first.
+pub const H_RETRIES: &str = "s1-retries";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -85,8 +93,14 @@ async fn raw(
     // Read the model for the header and the provider path only; the body
     // is sent as is. Only the top-level `model` is read, so a member the
     // typed protocol cannot read (left for the provider to judge) does not
-    // change where the request goes.
+    // change where the request goes. Inspection only sizes the limiter cost.
+    let inspected = proto.and_then(|p| p.inspect(&body).ok());
+    let tokens = inspected.as_ref().map_or(
+        body.len().div_ceil(protocol::BYTES_PER_TOKEN_SAFE) as u64,
+        |i| i.tokens_high(),
+    );
     let sent_model = proto.and_then(|_| protocol::top_level_model(&body));
+    let lane = Lane::from_headers(&headers);
     let (s1_model, upstream) = match sent_model.as_deref() {
         Some(m) => match st.catalog.provider_model(&provider, m) {
             Some(r) => (Some(r.id()), r.upstream().to_string()),
@@ -95,14 +109,20 @@ async fn raw(
         None => (None, String::new()),
     };
 
-    let result = backend
-        .call(BackendRequest {
-            upstream_model: upstream,
-            body: body.clone(),
-            headers,
-        })
-        .await;
-    let upstream_ms = started.elapsed().as_millis() as u64;
+    let (guard, credential) = st.guard_with_key(&provider).unzip();
+    let req = BackendRequest {
+        upstream_model: upstream,
+        body: body.clone(),
+        headers,
+        credential,
+    };
+    let (result, stats) = match &guard {
+        Some(g) => protect::call(g, backend.as_ref(), req, lane, tokens).await,
+        None => (backend.call(req).await, CallStats::default()),
+    };
+    let queue_wait_ms = stats.queue_wait.as_millis() as u64;
+    let upstream_ms = (started.elapsed().as_millis() as u64).saturating_sub(queue_wait_ms);
+    let capacity = guard.as_ref().map(|g| g.cap().to_string());
 
     match result {
         Ok(resp) => {
@@ -111,8 +131,12 @@ async fn raw(
                 ingress = %format!("raw/{pid}"),
                 backend = %provider,
                 model = s1_model.as_deref().unwrap_or(""),
+                lane = lane.as_str(),
                 status = resp.status.as_u16(),
                 upstream_ms,
+                queue_wait_ms,
+                retries = stats.retries,
+                input_tokens = tokens,
                 input_bytes = body.len(),
                 "request"
             );
@@ -124,6 +148,10 @@ async fn raw(
                 set(h, H_MODEL, m);
             }
             set(h, H_REQUEST_ID, &rid);
+            set(h, H_RETRIES, &stats.retries.to_string());
+            if let Some(c) = &capacity {
+                set(h, H_CAPACITY, c);
+            }
             out.body(Body::from(resp.body)).expect("valid response")
         }
         Err(err) => {
@@ -135,13 +163,22 @@ async fn raw(
                 status = err.status().as_u16(),
                 code = err.code(),
                 error = %err,
+                lane = lane.as_str(),
                 upstream_ms,
+                queue_wait_ms,
+                retries = stats.retries,
+                input_tokens = tokens,
                 input_bytes = body.len(),
                 "request failed"
             );
             let mut r = error_response(proto, &err, &rid, Some(&provider));
+            let h = r.headers_mut();
             if let Some(m) = &s1_model {
-                set(r.headers_mut(), H_MODEL, m);
+                set(h, H_MODEL, m);
+            }
+            set(h, H_RETRIES, &stats.retries.to_string());
+            if let Some(c) = &capacity {
+                set(h, H_CAPACITY, c);
             }
             r
         }

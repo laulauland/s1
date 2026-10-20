@@ -142,6 +142,7 @@ spill = false                 # use later entries only when the first is unavail
 - `blake3(family, resolved model version, canonical JSON of the request without the model field)`.
 - The resolved version comes from the `model` field of the provider response, so a `-latest` alias does not return stale answers after an update. On the first call with an alias, the router uses the last resolved version it has seen; a response with a new version replaces it.
 - Canonical JSON: sorted keys, no insignificant whitespace, numbers as given. Image content is hashed, not its path.
+- A request nested deeper than 128 levels gets no key: it skips the cache (no lookup, no store) and goes to the provider as usual.
 
 **`GET /v1/models`** returns the merged catalog and aliases, with capabilities and current state (`available`, `throttled_until`, `breaker_open`).
 
@@ -243,11 +244,24 @@ The numbers above are placeholders. Set them from each provider's real limits.
 - Two lanes: an interactive lane (single requests) has priority over a bulk lane (MCP list calls, and CLI streams after the first N requests).
 - When a queue is full: HTTP 429 with `Retry-After`, computed from the current drain rate. The OpenAI and TypeSafe SDKs already retry on this.
 - MCP list calls: the daemon estimates the run time from the drain rate before it starts. If the estimate exceeds the client timeout, it rejects the call with a suggested chunk size and a retry time.
-- The CLI keeps a window of requests in flight sized to the backend's current cap. When the window is full, it stops reading stdin, so the pipe blocks the producer.
+- The CLI keeps a window of requests in flight sized to the backend's current cap. When the window is full, it stops reading stdin, so the pipe blocks the producer. The window counts requests in flight and finished replies that wait for an earlier line (ordered output), so one slow line also stops stdin reads. Each reply is written as soon as its turn comes, also while stdin stays open.
 
-**`GET /status`** (and `s1 status`) per backend: queue depth per lane, current rate, current in-flight cap, limits, `throttled_until`, breaker state.
+**`GET /status`** (and `s1 status`) per backend: queue depth per lane, current rate, current in-flight cap, limits, `throttled_until`, breaker state. `throttled_until` (here and in `/v1/models`) is the earliest time a new request could start: the latest of the provider pause (`Retry-After` and quota headers, capped at 24 h) and the RPM and TPM bucket waits.
 
 Spend budgets wait for cost accounting (later).
+
+**As built (stage 3)**
+
+- Limiter: a token bucket per RPM and TPM, written in s1 (not `governor`), so that tests can drive it with a simulated clock and one check covers both buckets at once. The burst is a tenth of the limit and the refill fills the rest. Each bucket also keeps a log of the last 60 seconds of sends, and a request goes only when the logged tokens plus its cost are at most the limit, so no 60-second window ever holds more than the limit. A request larger than the burst goes only when the bucket is full and leaves it in debt. A request larger than the limit itself goes alone: after 60 seconds with no sends, and nothing else goes in the 60 seconds after it.
+- Tokens are a byte estimate (text bytes / 3, plus at most 1,027 tokens per image); no `tokenizers` yet.
+- `[limits.<provider>]` also takes `success_window_ms`, `retry_attempts`, `retry_base_ms`, `retry_max_ms`, `retry_after_max_ms`, `breaker_failures`, `breaker_window_ms`, and `breaker_cooldown_ms`. `retry_attempts` is 1 to 4 (default 4); a larger value is rejected. A provider without a table has no RPM or TPM limit (in-flight cap 32).
+- AIMD: a 429 halves the cap once per success window; a 429 for a request sent before the last decrease only extends the hold.
+- Retries obey `Retry-After` (seconds or HTTP date), `retry-after-ms`, Cloudflare `ratelimit` and OpenAI `x-ratelimit-*` headers. Every `ratelimit` policy counts, across comma-separated lists and repeated header values; s1 pauses until the longest reset among the exhausted policies. A pause longer than `retry_after_max_ms` (default 60 s) ends the retries: the client gets the provider's 429 and the backend stays throttled.
+- The breaker counts each failed attempt (5xx or a connection error), not each request. A 429 is not a failure. An open breaker gives `backend_unavailable` (503) with `Retry-After`.
+- Queue sizes are `[queue] max_requests` and `max_tokens` in `config.toml`, per backend and key. The key is resolved once, when the request is queued, and the request is sent with that key: a key changed with `s1 auth set` applies to new requests, not to ones already waiting under the old key's limits. Retries go to the front of their lane and are not bounded.
+- Request headers: `s1-lane: bulk` (default interactive), `Cache-Control: no-cache` (skip the lookup, store the fresh answer), `Cache-Control: no-store` (no cache). Response headers: `s1-cache` (`hit`, `miss`, `refresh`, `bypass`), `s1-capacity` (the backend's current in-flight cap), `s1-retries`. Cache hits also carry `s1-capacity` and `s1-retries: 0`.
+- `/v1/raw` goes through the same queue, limits, retries, and breaker, but not the cache.
+- The CLI sends its first 4 stream requests in the interactive lane and the rest in bulk. Its window starts at 4 and then follows `s1-capacity`; `-j` is an upper bound.
 
 ## Clients
 
@@ -332,6 +346,7 @@ No request payloads are stored. The cache keeps only key hashes and responses; l
 - Store: one embedded key-value file (`redb` or SQLite) in `~/.cache/s1/`.
 - Entry: key hash (see Model catalog and routing) → response bytes + resolved model + time.
 - Size cap (default 1 GiB) with LRU eviction. No TTL by default; `--no-cache` per request and `s1 cache clear`.
+- As built: `~/.cache/s1/cache.redb`; `[cache] enabled` and `max_bytes` in `config.toml`; `POST /cache/clear` on the daemon. `max_bytes` caps the file on disk: stored responses get 3/4 of it, each charged 256 bytes for its keys and index rows (the rest is room for redb pages and freed space), the file is compacted when it grows past the cap (plus 2 MiB for the fixed size of an empty redb file) and, if it is still over, the oldest entries go until it fits, and `s1 cache clear` and a daemon start with a lower cap evict and compact at once. `/status` reports `bytes` (responses plus the per-entry charge) and `file_bytes`. The key also holds the long-context opt-in. Last resolved versions are in `~/.local/state/s1/versions.json`.
 - Only successful responses are cached. Partial results (a refused question) are cached as returned.
 
 **Logging**

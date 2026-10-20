@@ -1,5 +1,5 @@
 //! The `s1` command line. One file per command group; new verbs (decide,
-//! extract, forecast, status) add a variant to [`Cmd`] and a module.
+//! extract, forecast) add a variant to [`Cmd`] and a module.
 
 use std::process::ExitCode;
 
@@ -8,11 +8,13 @@ use clap::{Parser, Subcommand};
 use crate::paths::Paths;
 
 mod auth;
+mod cache;
 pub mod client;
 mod daemon;
 pub mod decide;
 mod models;
 mod raw;
+mod status;
 pub mod stream;
 
 #[derive(Debug, Parser)]
@@ -35,6 +37,13 @@ enum Cmd {
     Models(models::ModelsArgs),
     /// Ask Decide questions: one text, or one JSON line in, one line out.
     Decide(decide::DecideArgs),
+    /// Queues, limits, and breakers per backend; cache size.
+    Status(status::StatusArgs),
+    /// Manage the response cache.
+    Cache {
+        #[command(subcommand)]
+        cmd: cache::CacheCmd,
+    },
     /// Manage provider keys in ~/.s1/auth.json.
     Auth {
         #[command(subcommand)]
@@ -52,6 +61,8 @@ pub fn main() -> ExitCode {
         Cmd::Models(args) => models::run(args, &paths),
         Cmd::Auth { cmd } => auth::run(cmd, &paths),
         Cmd::Decide(args) => decide::run(args, &paths),
+        Cmd::Status(args) => status::run(args, &paths),
+        Cmd::Cache { cmd } => cache::run(cmd, &paths),
     };
     match result {
         Ok(code) => code,
@@ -101,6 +112,10 @@ mod tests {
             &["s1", "auth", "set", "workers-ai", "--account-id", "x"],
             &["s1", "auth", "list"],
             &["s1", "auth", "token"],
+            &["s1", "status"],
+            &["s1", "status", "--json"],
+            &["s1", "cache", "clear"],
+            &["s1", "decide", "-t", "t.json", "--no-cache", "text"],
             &["s1", "decide", "-t", "t.json", "text"],
             &[
                 "s1",
