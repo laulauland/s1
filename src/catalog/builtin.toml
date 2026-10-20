@@ -80,7 +80,14 @@ id = "gpt-6-luna"
 upstream = "gpt-6-luna"
 context_tokens = 922000
 max_options = 255
+min_options = 2
+max_levels = 10
+min_levels = 2
+max_questions = 400
 images = "yes"
+# Systemone requests are translated: `assets` and Clef `images` both become
+# `input_image` parts; `box` has no OpenAI form.
+compat = { noul_confidence = false, images_array = true, box = false }
 
 [aliases.decide]
 models = ["workers-ai/clef-flash", "typesafe/jev-latest"]

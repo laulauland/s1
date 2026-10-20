@@ -374,3 +374,60 @@ fn cache_status_and_cache_clear_commands() {
     );
     assert!(!file.exists());
 }
+
+fn openai_triage() -> Value {
+    json!({
+        "questions": [
+            {"type": "predicate", "name": "urgent", "instructions": "Is this urgent?"},
+            {"type": "choice", "instructions": "Topic?", "choices": [
+                {"value": "billing", "description": "Money"},
+                {"value": true}
+            ]}
+        ]
+    })
+}
+
+#[test]
+fn openai_flag_uses_the_decisions_format() {
+    let env = Env::new();
+    env.ok(&["auth", "set", "openai"], common::OPENAI_KEY.as_bytes());
+    let t = env.template("openai.json", openai_triage());
+    let t = t.to_str().unwrap();
+    // Default alias: Clef, translated both ways.
+    let out = env.ok(
+        &["decide", "--openai", "-t", t, "Checkout is down, yes"],
+        b"",
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["answers"][0]["name"], "urgent");
+    assert_eq!(v["answers"][0]["probability"], 0.9);
+    assert_eq!(v["answers"][1]["name"], Value::Null);
+    assert_eq!(v["answers"][1]["choice"], "billing");
+    let sent: Value = serde_json::from_slice(&env.mocks.clef.last().body).unwrap();
+    assert_eq!(sent["state"], "Checkout is down, yes");
+
+    // Native OpenAI, flat, streaming: unnamed questions are `q{i}`.
+    let out = env.ok(
+        &[
+            "decide",
+            "--openai",
+            "-t",
+            t,
+            "-m",
+            "openai/gpt-6-luna",
+            "--flat",
+            "--state-field",
+            "body",
+        ],
+        b"{\"id\":7,\"body\":\"no\"}\n",
+    );
+    let rows = lines(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], 7);
+    assert_eq!(rows[0]["urgent"], 0.1);
+    assert_eq!(rows[0]["q1"], "billing");
+    assert_eq!(rows[0]["q1__p__bool:true"], 0.3);
+    let sent: Value = serde_json::from_slice(&env.mocks.luna.last().body).unwrap();
+    assert_eq!(sent["input"], "no");
+    assert_eq!(sent["model"], "gpt-6-luna");
+}

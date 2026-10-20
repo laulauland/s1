@@ -117,6 +117,7 @@ mod tests {
             &["s1", "cache", "clear"],
             &["s1", "decide", "-t", "t.json", "--no-cache", "text"],
             &["s1", "decide", "-t", "t.json", "text"],
+            &["s1", "decide", "--openai", "-t", "t.json", "text"],
             &[
                 "s1",
                 "decide",

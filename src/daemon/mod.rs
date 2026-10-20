@@ -26,12 +26,14 @@ use crate::secrets::{ApiKey, KeyResolver, Secret};
 
 mod auth;
 mod cache;
+mod decode;
 mod ingress;
 mod models;
 mod raw;
 mod routes;
 mod status;
 
+pub use raw::MAX_BODY;
 pub use routes::router;
 
 /// Shared state of all handlers.
@@ -46,6 +48,9 @@ pub struct AppState {
     pub cache: Option<Arc<Cache>>,
     /// Last resolved model versions (part of the cache key).
     pub versions: Arc<Versions>,
+    /// Which image URLs s1 fetches toward systemone (public HTTPS only by
+    /// default).
+    pub image_fetch: crate::translate::fetch::FetchPolicy,
 }
 
 impl AppState {
@@ -61,6 +66,7 @@ impl AppState {
             protection,
             cache: None,
             versions: Arc::new(Versions::in_memory()),
+            image_fetch: crate::translate::fetch::FetchPolicy::PUBLIC_HTTPS,
         }
     }
 
@@ -72,6 +78,12 @@ impl AppState {
 
     pub fn with_cache(mut self, cache: Arc<Cache>) -> Self {
         self.cache = Some(cache);
+        self
+    }
+
+    /// Replace the image URL fetch policy (tests serve images on loopback).
+    pub fn with_image_fetch(mut self, policy: crate::translate::fetch::FetchPolicy) -> Self {
+        self.image_fetch = policy;
         self
     }
 

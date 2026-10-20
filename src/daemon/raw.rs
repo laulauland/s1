@@ -4,19 +4,21 @@
 //! response comes back unchanged, plus `s1-backend`, `s1-model`, and
 //! `s1-request-id` headers. No routing by alias and no cache, but the
 //! request goes through the provider's queue, limits, retries, and breaker
-//! like any other (lane from `s1-lane`).
+//! like any other (lane from `s1-lane`). A `zstd` or `gzip` body is decoded
+//! into a copy only to size the limiter cost and read `model`.
 
 use std::time::Instant;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::routing::post;
 use bytes::Bytes;
 use serde::Deserialize;
 
+use super::decode::decode_body;
 use super::{AppState, request_id};
 use crate::backend::BackendRequest;
 use crate::error::S1Error;
@@ -36,9 +38,23 @@ pub const H_CAPACITY: &str = "s1-capacity";
 pub const H_RETRIES: &str = "s1-retries";
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/v1/raw/{protocol}", post(raw))
-        .layer(DefaultBodyLimit::max(MAX_BODY))
+    Router::new().route("/v1/raw/{protocol}", post(raw))
+}
+
+/// The request body, at most [`MAX_BODY`] bytes. Over that is `too_long`,
+/// so the caller renders it in the ingress's own error format (axum's own
+/// limit rejection is plain text).
+pub(super) async fn read_body(body: Body) -> Result<Bytes, S1Error> {
+    axum::body::to_bytes(body, MAX_BODY).await.map_err(|e| {
+        let mut source = std::error::Error::source(&e);
+        while let Some(s) = source {
+            if s.is::<http_body_util::LengthLimitError>() {
+                return S1Error::TooLong(format!("request body is over {MAX_BODY} bytes"));
+            }
+            source = s.source();
+        }
+        S1Error::InvalidRequest(format!("cannot read the request body: {e}"))
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,7 +77,7 @@ async fn raw(
     Path(protocol): Path<String>,
     Query(q): Query<RawQuery>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let rid = request_id();
     let started = Instant::now();
@@ -70,6 +86,10 @@ async fn raw(
         return error_response(None, &err, &rid, None);
     };
     let proto = protocol::by_id(pid);
+    let body = match read_body(body).await {
+        Ok(b) => b,
+        Err(err) => return error_response(proto, &err, &rid, None),
+    };
     let provider = match q.provider.as_deref().or(default_provider(pid)) {
         Some(p) => p.to_string(),
         None => {
@@ -94,12 +114,24 @@ async fn raw(
     // is sent as is. Only the top-level `model` is read, so a member the
     // typed protocol cannot read (left for the provider to judge) does not
     // change where the request goes. Inspection only sizes the limiter cost.
-    let inspected = proto.and_then(|p| p.inspect(&body).ok());
+    //
+    // A compressed body is read from a decoded copy (same cap as the typed
+    // ingresses), so compression does not lower the limiter cost. The
+    // provider still gets the original bytes and Content-Encoding. A body
+    // that does not decode (unknown encoding, bad data) is costed by its
+    // own size and left for the provider to judge.
+    let view = match decode_body(&mut headers.clone(), body.clone(), MAX_BODY) {
+        Ok(decoded) => decoded,
+        Err(err @ S1Error::TooLong(_)) => return error_response(proto, &err, &rid, None),
+        Err(_) => body.clone(),
+    };
+    let inspected = proto.and_then(|p| p.inspect(&view).ok());
     let tokens = inspected.as_ref().map_or(
-        body.len().div_ceil(protocol::BYTES_PER_TOKEN_SAFE) as u64,
+        view.len().div_ceil(protocol::BYTES_PER_TOKEN_SAFE) as u64,
         |i| i.tokens_high(),
     );
-    let sent_model = proto.and_then(|_| protocol::top_level_model(&body));
+    let sent_model = proto.and_then(|_| protocol::top_level_model(&view));
+    drop(view);
     let lane = Lane::from_headers(&headers);
     let (s1_model, upstream) = match sent_model.as_deref() {
         Some(m) => match st.catalog.provider_model(&provider, m) {

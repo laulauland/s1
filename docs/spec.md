@@ -141,7 +141,7 @@ spill = false                 # use later entries only when the first is unavail
 
 - `blake3(family, resolved model version, canonical JSON of the request without the model field)`.
 - The resolved version comes from the `model` field of the provider response, so a `-latest` alias does not return stale answers after an update. On the first call with an alias, the router uses the last resolved version it has seen; a response with a new version replaces it.
-- Canonical JSON: sorted keys, no insignificant whitespace, numbers as given. Image content is hashed, not its path.
+- Canonical JSON: sorted keys, no insignificant whitespace, numbers as given. Image content is hashed, not its path or URL: local image paths are read into inline data before the key is made, and image URLs that s1 fetches (toward systemone) are fetched and inlined before the cache lookup. A request with image URLs that the provider fetches itself (native OpenAI Decisions) skips the cache (`s1-cache: bypass`), because s1 never sees the content.
 - A request nested deeper than 128 levels gets no key: it skips the cache (no lookup, no store) and goes to the provider as usual.
 
 **`GET /v1/models`** returns the merged catalog and aliases, with capabilities and current state (`available`, `throttled_until`, `breaker_open`).
@@ -213,6 +213,28 @@ trait Translate {
 | Refusal | `type: refusal` | None | To a systemone client: per-question error object, no invented value |
 | `box` | None | Preview type | `unsupported` for non-Jev backends |
 | Noul confidence | None | None | Never added |
+
+**As built (stage 4)**
+
+- `src/translate/`: `decide.rs` (the table above, both directions), `errors.rs` (provider error bodies in the client's format, status kept), `fetch.rs` (image URLs to data URLs, toward systemone only; PNG or JPEG, 16 MiB each, 128 per request). Registration: `translate::translator`.
+- Image URL fetch (toward systemone): only `https` URLs whose host is, or resolves only to, public addresses (no loopback, private, link-local, shared, documentation, multicast, or reserved ranges, and no IPv6 forms of them). The check runs in the fetch client's DNS resolver, so the checked address is the one connected to, and again on each redirect (at most 5); no proxy. All images of one request share one budget, checked while the bytes arrive: the body with images inlined must stay within the 64 MiB body limit, else `too_long`. At most 16 downloads run at a time in the daemon. Errors and logs name an image by position (`input[0].content[1]`), never by URL. A key spelled with JSON escapes (`"image\u005furl"`) counts as `image_url`.
+- Placeholders made toward systemone are absent from the input text and from every string in the questions. Toward OpenAI, a structured (object or list) `state` goes as its compact JSON text, cut into image parts only at asset references inside its string values (not object keys), matched before JSON escaping.
+- Flat columns of OpenAI choice values are one-to-one: `true` / `false` are `bool:true` / `bool:false`, other non-strings are `json:<compact JSON>` (`json:1`, `json:null`), and a string that starts with `bool:`, `json:`, or `str:` gets a `str:` prefix (`str:bool:true`). Score columns stay `q__p__<level>`.
+- A missing or wrong TCP bearer token is 401 in the endpoint's format: `/v1/systemone` gives `{"detail": {"error_type": "unauthorized", …}}`, `/v1/decisions` the OpenAI error shape with `type` `authentication_error` and `code` `unauthorized`; other endpoints keep the generic `{"error": {"code", "message"}}`.
+- The router accepts any backend whose format can be translated from the ingress (`Route.api`); the ingress translates the request after the cache lookup and the answer before the cache store, so the cache holds client-format answers.
+- Names: a free client name is kept; an unnamed question gets `q{i}`; a taken name gets `_1`, `_2`, …. Answers to OpenAI clients have the client's `name` (or `null`).
+- Noul criteria go to OpenAI as `\n\nTrue if: …` and `\n\nFalse if: …` suffixes on `instructions`; from OpenAI they are read back into `criteria`. Client text that holds `True if: ` or `False if: ` is escaped with a U+200B (zero width space) before the colon (one more for each U+200B already there), so only s1's own suffixes have none and the client text reads back unchanged.
+- Choice names `bool:true` and `bool:false` are the names of OpenAI's boolean values in both directions: a systemone choice named `bool:true` goes to OpenAI as the boolean `true`, and its answer comes back as `bool:true`. A systemone client has only string names, so nothing is lost. Toward systemone, an OpenAI string value `"bool:true"` or `"bool:false"` is `unsupported` (it would come back as a boolean).
+- Systemone `state`, `instructions`, and `criteria` values that are not strings (objects, lists) go to OpenAI as compact JSON text; OpenAI has only text, so a round trip returns them as JSON strings.
+- OpenAI `input` messages must be `user` role; adjacent text parts join with a newline, messages with a blank line; each image becomes a `<s1-image-{i}>` placeholder (no separator next to it) and an asset; the same image data twice is one asset. Toward OpenAI, `state` is split at the placeholders into text and image parts of one user message. Placeholder names, the asset format (`jpg` becomes `jpeg`), and message bounds do not survive a round trip. An asset placeholder in a question's `instructions` or `criteria` is `unsupported` toward OpenAI (OpenAI takes images only in the input). Clef `images` items become `input_image` parts.
+- Toward OpenAI, every image occurrence counts: one asset referenced many times expands once per reference. The image data URLs of one request (assets per reference plus Clef `images`) may total at most 64 MiB (the body limit), checked before each image is built; over that is `too_long`. More than 128 occurrences (OpenAI's per-request image limit) is `unsupported` for an OpenAI model: an alias skips it, a named model fails before the call. Routing context checks and the limiter cost count each occurrence as one image (at most 1,027 tokens).
+- On `/v1/decisions`, the Clef limits (missing instructions, names outside `[A-Za-z0-9_.-]{1,100}`) are read from the questions as a systemone backend gets them: an unnamed question is `q{i}`, and a predicate whose `instructions` hold only appended `True if: ` / `False if: ` criteria has no instructions. Such requests on an alias skip Clef.
+- Answers toward a systemone client are keyed by the client's names; when an OpenAI request repeats a `name`, later answers use the unique systemone name (`a_1`), so no answer is lost.
+- A typed or raw ingress reads at most 64 MiB of body; over that is `too_long` (413) in the ingress's own error format with `s1-request-id`.
+- A refusal or any non-answer reaches a systemone client as `{"type": "error", "error": {"code": "refusal", "message": …}}`; a systemone `error` answer reaches an OpenAI client as `refusal`.
+- Typed ingresses decode `Content-Encoding: zstd` and `gzip` request bodies (the TypeSafe Python SDK sends zstd for bodies of 1 KiB or more on Python 3.14+). `/v1/raw` forwards the compressed bytes and `Content-Encoding` unchanged, but sizes the limiter cost (and reads `model`) from a decoded copy, so compression does not get around `tpm`; a decoded body over 64 MiB is `too_long`. Multipart bodies (TypeSafe SDK `part` assets) are not supported.
+- Live (2026-10-20): `gpt-6-luna` takes 1 to 400 questions; Jev rejects small images (`Invalid image dimensions.` for 256x256; 512x512 works) and takes asset formats `png`, `jpg`, `jpeg`.
+- SDK conformance: `conformance/` (uv project, Python 3.14, `openai` 3.35.1 and `typesafe-sdk` 0.7.5), run by `tests/conformance.rs` with `S1_CONFORMANCE=1` (mocks) and with `S1_LIVE=1` also (real providers).
 
 **Errors.** Each ingress returns errors in its own format. s1-specific errors use these codes in every format: `queue_full` (429), `too_long` (413), `unsupported` (422), `wrong_family` (400), `backend_unavailable` (503).
 
@@ -394,10 +416,11 @@ Property tests with `proptest` carry most of the weight. Example tests and recor
 
 | Area | Property |
 | --- | --- |
-| Translation | systemone → OpenAI Decisions → systemone returns the same request, for every request without OpenAI-only features |
+| Translation | systemone → OpenAI Decisions → systemone returns the same request, for every request with string texts (empty strings included) and no images; non-string texts come back as their JSON text, and empty `instructions` come back as absent (OpenAI always has `instructions`) |
+| Translation | OpenAI Decisions → systemone → OpenAI Decisions keeps image input exactly (one user message of text and image parts) |
 | Translation | Answers come back with the same names and in request order, for any mix of named and unnamed questions |
 | Translation | Boolean and string choice values with the same text stay distinct after a round trip |
-| Cache key | JSON key order and whitespace do not change the key; any change to a question, option, or field does |
+| Cache key | JSON key order and whitespace do not change the key; any change to a question, option, or field does; new content at the same image URL misses; image URLs that s1 does not fetch bypass the cache |
 | Rate limiter | With a simulated clock and random arrivals, sent requests never exceed RPM, TPM, or the in-flight cap in any window |
 | AIMD | After a 429, the in-flight cap never rises above half its earlier value until a success window passes |
 | Queue | Depth never exceeds its bound; every accepted request ends with exactly one result or error |

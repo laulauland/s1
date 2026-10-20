@@ -1,0 +1,1 @@
+{"model":"gpt-6-luna","answers":{"blank":{"type":"error","error":{"code":"refusal","message":"OpenAI Decisions refused to answer this question"}}},"usage":{"input_tokens":7,"output_tokens":0}}

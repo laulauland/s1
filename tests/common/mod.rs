@@ -1,4 +1,5 @@
-//! Shared test helpers: in-process mock TypeSafe and Workers AI servers, and fixtures.
+//! Shared test helpers: in-process mock TypeSafe, Workers AI and OpenAI
+//! servers, and fixtures.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
@@ -19,6 +20,7 @@ pub const TEST_KEY: &str = "ts-test-key-0123456789";
 pub const MISSING_KEY: &str = "ts-key-the-mock-treats-as-missing";
 pub const CF_TOKEN: &str = "cf-test-token-0123456789";
 pub const CF_ACCOUNT: &str = "acc0123";
+pub const OPENAI_KEY: &str = "sk-test-key-0123456789";
 
 pub fn fixture(name: &str) -> Vec<u8> {
     let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -338,12 +340,145 @@ async fn workers_ai_run(
     envelope_reply(StatusCode::OK, serde_json::to_vec(&env).unwrap())
 }
 
-/// Both mocks, started in the current runtime.
+/// Mock of OpenAI `POST /v1/decisions` with the behaviour seen live
+/// (fixtures in `openai/`): wrong key -> 401, fewer than 2 choices -> 400,
+/// empty instructions or "REFUSE" in them -> a refusal for that question.
+pub fn mock_openai_router(rec: Recorder) -> Router {
+    Router::new()
+        .route("/v1/decisions", post(openai_decisions))
+        .layer(DefaultBodyLimit::disable())
+        .with_state(rec)
+}
+
+fn openai_reply(status: StatusCode, body: Vec<u8>) -> Response {
+    (
+        status,
+        [
+            ("content-type", "application/json"),
+            ("x-request-id", "req_mock_openai"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn openai_decisions(
+    State(rec): State<Recorder>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    rec.0.lock().unwrap().push(Seen {
+        path: "/v1/decisions".into(),
+        headers: headers.clone(),
+        body: body.clone(),
+    });
+    let authorized = headers.get("authorization").and_then(|v| v.to_str().ok())
+        == Some(&format!("Bearer {OPENAI_KEY}"));
+    if !authorized {
+        return openai_reply(
+            StatusCode::UNAUTHORIZED,
+            fixture("openai/invalid_key.401.json"),
+        );
+    }
+    let Ok(req) = serde_json::from_slice::<Value>(&body) else {
+        return openai_reply(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"We could not parse the JSON body of your request.","type":"invalid_request_error","param":null,"code":null}}"#.to_vec(),
+        );
+    };
+    let fixture_req: Value =
+        serde_json::from_slice(&fixture("openai/triage.request.json")).unwrap();
+    if req == fixture_req {
+        return openai_reply(StatusCode::OK, fixture("openai/triage.response.json"));
+    }
+    let questions = req["questions"].as_array().cloned().unwrap_or_default();
+    if questions
+        .iter()
+        .any(|q| q["type"] == "choice" && q["choices"].as_array().is_some_and(|c| c.len() < 2))
+    {
+        return openai_reply(
+            StatusCode::BAD_REQUEST,
+            fixture("openai/one_choice.400.json"),
+        );
+    }
+    if req["model"] != "gpt-6-luna" {
+        return openai_reply(
+            StatusCode::NOT_FOUND,
+            fixture("openai/model_not_found.404.json"),
+        );
+    }
+    mock_sleep(&json!({"state": req["input"]})).await;
+    let input = req["input"].to_string();
+    let answers: Vec<Value> = questions
+        .iter()
+        .map(|q| fake_openai_answer(q, &input))
+        .collect();
+    let out = json!({
+        "model": "gpt-6-luna",
+        "answers": answers,
+        "usage": {
+            "input_tokens": 50,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens": 0,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 50
+        }
+    });
+    openai_reply(StatusCode::OK, serde_json::to_vec(&out).unwrap())
+}
+
+/// Deterministic OpenAI answers, like [`fake_response`]: predicate is 0.9
+/// when the input holds "yes"; choice picks the first; score the top level.
+pub fn fake_openai_answer(q: &Value, input: &str) -> Value {
+    let name = q.get("name").cloned().unwrap_or(Value::Null);
+    let instr = q["instructions"].as_str().unwrap_or("");
+    if instr.is_empty() || instr.contains("REFUSE") {
+        return json!({"type": "refusal", "name": name});
+    }
+    match q["type"].as_str() {
+        Some("predicate") => {
+            json!({"type": "predicate", "name": name, "probability": if input.contains("yes") { 0.9 } else { 0.1 }})
+        }
+        Some("choice") => {
+            let choices = q["choices"].as_array().unwrap();
+            let probs: Vec<Value> = choices
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let p = if i == 0 {
+                        0.7
+                    } else {
+                        0.3 / (choices.len() - 1) as f64
+                    };
+                    json!({"value": c["value"], "probability": p})
+                })
+                .collect();
+            json!({"type": "choice", "name": name, "choice": choices[0]["value"], "probabilities": probs, "confidence": 0.6})
+        }
+        Some("score") => {
+            let levels = q["levels"].as_array().unwrap();
+            let probs: Vec<Value> = levels
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let p = if i + 1 == levels.len() { 1.0 } else { 0.0 };
+                    json!({"value": i, "label": l["label"], "probability": p})
+                })
+                .collect();
+            json!({"type": "score", "name": name, "score": (levels.len() - 1) as f64, "probabilities": probs, "confidence": 0.5})
+        }
+        _ => json!({"type": "refusal", "name": name}),
+    }
+}
+
+/// All mocks, started in the current runtime.
 pub struct Mocks {
     pub typesafe: SocketAddr,
     pub jev: Recorder,
     pub workers_ai: SocketAddr,
     pub clef: Recorder,
+    pub openai: SocketAddr,
+    pub luna: Recorder,
 }
 
 impl Mocks {
@@ -356,19 +491,28 @@ impl Mocks {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
+        let luna = Recorder::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let openai = listener.local_addr().unwrap();
+        let app = mock_openai_router(luna.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
         Self {
             typesafe,
             jev,
             workers_ai,
             clef,
+            openai,
+            luna,
         }
     }
 
-    /// Overlay pointing both providers at the mocks.
+    /// Overlay pointing every provider at the mocks.
     pub fn overlay(&self) -> String {
         format!(
-            "[providers.typesafe]\nbase_url = \"http://{}\"\n[providers.workers-ai]\nbase_url = \"http://{}\"\n",
-            self.typesafe, self.workers_ai
+            "[providers.typesafe]\nbase_url = \"http://{}\"\n[providers.workers-ai]\nbase_url = \"http://{}\"\n[providers.openai]\nbase_url = \"http://{}/v1\"\n",
+            self.typesafe, self.workers_ai, self.openai
         )
     }
 }

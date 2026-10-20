@@ -63,6 +63,8 @@ struct MockState {
     seen: Vec<String>,
     /// `authorization` header of every request, in arrival order.
     auths: Vec<String>,
+    /// Request body bytes as received, in arrival order.
+    bodies: Vec<Vec<u8>>,
     /// Model version in successful answers.
     version: String,
     /// Delay of default (scripted-out) answers.
@@ -108,6 +110,9 @@ impl Mock {
     }
     fn auths(&self) -> Vec<String> {
         self.state.lock().unwrap().auths.clone()
+    }
+    fn bodies(&self) -> Vec<Vec<u8>> {
+        self.state.lock().unwrap().bodies.clone()
     }
     fn set_delay(&self, ms: u64) {
         self.state.lock().unwrap().delay_ms = ms;
@@ -167,6 +172,7 @@ async fn serve_conn(mut sock: TcpStream, st: Arc<Mutex<MockState>>) {
         let mut s = st.lock().unwrap();
         s.seen.push(req["state"].as_str().unwrap_or("").to_string());
         s.auths.push(auth);
+        s.bodies.push(body.clone());
         s.in_flight += 1;
         s.max_in_flight = s.max_in_flight.max(s.in_flight);
         (s.script.pop_front(), s.version.clone(), s.delay_ms)
@@ -811,6 +817,103 @@ async fn raw_passthrough_is_guarded_too() {
     h.server.shutdown().await;
 }
 
+/// Tokens the `typesafe` limiter counted in the last minute.
+async fn tokens_counted(h: &Harness) -> u64 {
+    h.backend_status("typesafe").await["rate"]["tokens_last_minute"]
+        .as_u64()
+        .unwrap()
+}
+
+fn gzip(plain: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(plain).unwrap();
+    gz.finish().unwrap()
+}
+
+#[tokio::test]
+async fn raw_compressed_bodies_cost_their_decoded_size() {
+    // A compressed raw body costs what its decoded body costs, so
+    // compression cannot get around tpm. The provider still gets the
+    // original bytes and Content-Encoding.
+    let h = harness(Opts::default()).await;
+    let plain = body("jev-latest", &"a".repeat(60_000));
+    let z = zstd::encode_all(&plain[..], 3).unwrap();
+    let gz = gzip(&plain);
+    assert!(z.len() * 10 < plain.len() && gz.len() * 10 < plain.len());
+
+    let mut costs = Vec::new();
+    for (enc, bytes) in [(None, &plain), (Some("zstd"), &z), (Some("gzip"), &gz)] {
+        let before = tokens_counted(&h).await;
+        let headers: Vec<(&str, &str)> = enc.map(|e| ("content-encoding", e)).into_iter().collect();
+        let r = h
+            .send(Method::POST, "/v1/raw/systemone", &headers, bytes)
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{enc:?}: {}", text(&r));
+        assert_eq!(header(&r, "s1-model"), "typesafe/jev-latest", "{enc:?}");
+        costs.push(tokens_counted(&h).await - before);
+    }
+    assert!(costs[0] >= 15_000, "{costs:?}");
+    assert_eq!(costs, [costs[0]; 3], "plain, zstd, gzip");
+    let bodies = h.ts.bodies();
+    assert_eq!(bodies[0], plain);
+    assert_eq!(bodies[1], z, "zstd forwarded unchanged");
+    assert_eq!(bodies[2], gz, "gzip forwarded unchanged");
+    h.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn raw_compressed_bodies_are_throttled_like_plain_ones() {
+    // tpm 360000: burst 36000, refill about 6000 a second. Each body is
+    // about 20000 tokens decoded, so the second one waits about 0.7 s for
+    // the bucket; costed by compressed size it would not wait at all.
+    for enc in [None, Some("zstd"), Some("gzip")] {
+        let h = harness(Opts {
+            overlay: "[limits.typesafe]\ntpm = 360000\n",
+            ..Default::default()
+        })
+        .await;
+        let t0 = Instant::now();
+        for i in 0..2 {
+            let plain = body("jev-latest", &format!("{i}{}", "a".repeat(60_000)));
+            let bytes = match enc {
+                None => plain,
+                Some("zstd") => zstd::encode_all(&plain[..], 3).unwrap(),
+                Some(_) => gzip(&plain),
+            };
+            let headers: Vec<(&str, &str)> =
+                enc.map(|e| ("content-encoding", e)).into_iter().collect();
+            let r = h
+                .send(Method::POST, "/v1/raw/systemone", &headers, &bytes)
+                .await;
+            assert_eq!(r.status, StatusCode::OK, "{enc:?}: {}", text(&r));
+        }
+        assert!(
+            t0.elapsed() >= Duration::from_millis(400),
+            "{enc:?}: {:?}",
+            t0.elapsed()
+        );
+        h.server.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn raw_compressed_body_over_the_cap_is_too_long() {
+    let h = harness(Opts::default()).await;
+    let bomb = zstd::encode_all(&vec![b' '; 64 * 1024 * 1024 + 1][..], 19).unwrap();
+    let r = h
+        .send(
+            Method::POST,
+            "/v1/raw/systemone",
+            &[("content-encoding", "zstd")],
+            &bomb,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", text(&r));
+    assert_eq!(h.ts.calls(), 0);
+    h.server.shutdown().await;
+}
+
 #[tokio::test]
 async fn status_lists_idle_backends_with_keys() {
     let h = harness(Opts::default()).await;
@@ -991,5 +1094,32 @@ async fn cache_clear_endpoint_empties_the_store() {
     let v: Value = serde_json::from_slice(&r.body).unwrap();
     assert_eq!(v["cleared"], 1);
     assert_eq!(header(&h.post(&a).await, "s1-cache"), "miss");
+    h.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn raw_gzip_with_several_members_costs_all_of_them() {
+    // A gzip body may hold several members. The cost and the model come
+    // from all of them, not from the first member only.
+    let h = harness(Opts::default()).await;
+    let plain = body("jev-latest", &"a".repeat(60_000));
+    let (head, tail) = plain.split_at(31);
+    let mut multi = gzip(head);
+    multi.extend(gzip(tail));
+
+    let mut costs = Vec::new();
+    for (enc, bytes) in [(None, &plain), (Some("gzip"), &multi)] {
+        let before = tokens_counted(&h).await;
+        let headers: Vec<(&str, &str)> = enc.map(|e| ("content-encoding", e)).into_iter().collect();
+        let r = h
+            .send(Method::POST, "/v1/raw/systemone", &headers, bytes)
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{enc:?}: {}", text(&r));
+        assert_eq!(header(&r, "s1-model"), "typesafe/jev-latest", "{enc:?}");
+        costs.push(tokens_counted(&h).await - before);
+    }
+    assert!(costs[0] >= 15_000, "{costs:?}");
+    assert_eq!(costs[0], costs[1], "plain, multi-member gzip");
+    assert_eq!(h.ts.bodies()[1], multi, "gzip forwarded unchanged");
     h.server.shutdown().await;
 }

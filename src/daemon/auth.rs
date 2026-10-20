@@ -26,14 +26,30 @@ async fn check(State(token): State<Secret>, req: Request, next: Next) -> Respons
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, "Bearer")],
-        axum::Json(serde_json::json!({
-            "error": {
-                "code": "unauthorized",
-                "message": "missing or wrong bearer token; see `s1 auth token`"
-            }
-        })),
+        axum::Json(unauthorized_body(req.uri().path())),
     )
         .into_response()
+}
+
+/// The 401 body in the format of the endpoint's ingress (spec: errors in
+/// each ingress's own format), else the generic s1 envelope.
+fn unauthorized_body(path: &str) -> serde_json::Value {
+    const CODE: &str = "unauthorized";
+    const MESSAGE: &str = "missing or wrong bearer token; see `s1 auth token`";
+    match path {
+        "/v1/systemone" => serde_json::json!({
+            "detail": {"error_type": CODE, "message": MESSAGE}
+        }),
+        "/v1/decisions" => serde_json::json!({
+            "error": {
+                "message": MESSAGE,
+                "type": "authentication_error",
+                "param": null,
+                "code": CODE
+            }
+        }),
+        _ => serde_json::json!({"error": {"code": CODE, "message": MESSAGE}}),
+    }
 }
 
 /// Constant-time compare (`subtle`); unequal lengths are unequal.

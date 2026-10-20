@@ -1,0 +1,8 @@
+[project]
+name = "s1-conformance"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "openai==3.35.1",
+    "typesafe-sdk==0.7.5",
+]

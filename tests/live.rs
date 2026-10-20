@@ -1,11 +1,14 @@
-//! Live smoke test against the real TypeSafe API. Manual and opt-in:
+//! Live smoke tests against the real TypeSafe, Workers AI and OpenAI APIs.
+//! Manual and opt-in:
 //!
 //! ```sh
 //! S1_LIVE=1 cargo test --test live -- --ignored
 //! ```
 //!
-//! The key comes from `TYPESAFE_API_KEY` or `~/.s1/auth.json` (read only).
-//! Without `S1_LIVE=1` or without a key, the test skips.
+//! Keys come from `TYPESAFE_API_KEY`, `CLOUDFLARE_API_TOKEN` and
+//! `CLOUDFLARE_ACCOUNT_ID`, `OPENAI_API_KEY`, or `~/.s1/auth.json` (read
+//! only). Without `S1_LIVE=1` or without a key, the test skips.
+//! `S1_RECORD=1` saves some answers as fixtures (never keys).
 
 use axum::http::{HeaderMap, HeaderValue, Method};
 use bytes::Bytes;
@@ -97,6 +100,7 @@ async fn live_server_with(
         };
         match *p {
             "typesafe" => env.push(("TYPESAFE_API_KEY", k.key.expose().to_string())),
+            "openai" => env.push(("OPENAI_API_KEY", k.key.expose().to_string())),
             "workers-ai" => {
                 let Some(acc) = k.account_id.clone() else {
                     eprintln!("skip: no Cloudflare account id");
@@ -132,12 +136,16 @@ async fn live_server_with(
 }
 
 async fn post_systemone(paths: &Paths, body: &[u8]) -> s1::cli::client::Reply {
+    post_to(paths, "/v1/systemone", body).await
+}
+
+async fn post_to(paths: &Paths, path: &str, body: &[u8]) -> s1::cli::client::Reply {
     let mut h = HeaderMap::new();
     h.insert("content-type", HeaderValue::from_static("application/json"));
     request(
         &paths.socket,
         Method::POST,
-        "/v1/systemone",
+        path,
         h,
         Bytes::copy_from_slice(body),
     )
@@ -285,4 +293,97 @@ async fn live_protection_cache_and_status() {
     assert_eq!(ts["rate"]["requests_last_minute"], 1, "{ts}");
     assert_eq!(ts["breaker"]["state"], "closed");
     assert_eq!(s["cache"]["entries"], 1);
+}
+
+fn openai_triage(model: &str) -> Vec<u8> {
+    let path = format!(
+        "{}/tests/fixtures/openai/triage.request.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut v: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    v["model"] = Value::String(model.into());
+    serde_json::to_vec(&v).unwrap()
+}
+
+fn ok(reply: &s1::cli::client::Reply) {
+    assert_eq!(
+        reply.status.as_u16(),
+        200,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+}
+
+/// Stage 4: native `/v1/decisions`, systemone to OpenAI (with a refusal
+/// as a per-question error), and OpenAI format to Jev.
+#[tokio::test]
+#[ignore = "live: needs S1_LIVE=1, an OpenAI key and a TypeSafe key"]
+async fn live_openai_decisions_both_ways() {
+    let Some((_dir, paths, server)) = live_server(&["openai", "typesafe"]).await else {
+        return;
+    };
+    // Native.
+    let r = post_to(&paths, "/v1/decisions", &openai_triage("openai/gpt-6-luna")).await;
+    ok(&r);
+    assert_eq!(r.headers["s1-backend"], "openai");
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(v["answers"][0]["name"], "billing");
+    assert_eq!(v["answers"][1]["name"], Value::Null);
+    assert_eq!(v["answers"][2]["type"], "score");
+
+    // systemone client, OpenAI backend.
+    let body = serde_json::json!({
+        "model": "openai/gpt-6-luna",
+        "state": "Checkout has been failing for every customer for the last hour.",
+        "questions": {
+            "team": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": "Payments", "technical": "Outages"}},
+            "urgent": {"type": "noul", "instructions": "Is this urgent?", "criteria": {"true": "Many customers are affected"}}
+        }
+    });
+    let r = post_systemone(&paths, &serde_json::to_vec(&body).unwrap()).await;
+    ok(&r);
+    record("openai/systemone_via_openai.response.json", &r.body);
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    let keys: Vec<&String> = v["answers"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["team", "urgent"]);
+    assert_eq!(v["answers"]["team"]["choice"], "technical");
+    assert_eq!(v["answers"]["urgent"]["type"], "noul");
+
+    // The recorded refusal case (`refusal.request.json`) as systemone: the
+    // refusal is a per-question error. The model does not always refuse.
+    let body = br#"{"model":"openai/gpt-6-luna","state":"rate 7","questions":{"blank":{"type":"noul","instructions":""}}}"#;
+    let r = post_systemone(&paths, body).await;
+    ok(&r);
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    match v["answers"]["blank"]["type"].as_str() {
+        Some("error") => {
+            assert_eq!(v["answers"]["blank"]["error"]["code"], "refusal");
+            record("openai/systemone_refusal.response.json", &r.body);
+        }
+        Some("noul") => eprintln!("note: the model answered instead of refusing this time"),
+        other => panic!("unexpected answer type {other:?}: {v}"),
+    }
+
+    // OpenAI client, Jev backend.
+    let r = post_to(
+        &paths,
+        "/v1/decisions",
+        &openai_triage("typesafe/jev-latest"),
+    )
+    .await;
+    server.shutdown().await;
+    ok(&r);
+    record("openai/decisions_via_jev.response.json", &r.body);
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(v["answers"][0]["type"], "predicate");
+    assert_eq!(v["answers"][0]["name"], "billing");
+    assert_eq!(v["answers"][1]["choice"], "billing");
+    let values: Vec<&Value> = v["answers"][1]["probabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| &p["value"])
+        .collect();
+    assert!(values.contains(&&Value::Bool(true)), "{values:?}");
+    assert_eq!(v["answers"][2]["probabilities"][1]["label"], "Medium");
 }

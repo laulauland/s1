@@ -1,0 +1,1 @@
+{"model":"gpt-6-luna","answers":{"team":{"type":"choice","choice":"technical","confidence":1.0,"probabilities":{"billing":0.0,"technical":1.0}},"urgent":{"type":"noul","noul":1.0}},"usage":{"input_tokens":277,"output_tokens":0}}

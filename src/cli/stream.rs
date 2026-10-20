@@ -74,6 +74,10 @@ pub enum StateMode {
     Value,
     /// As JSON text (Clairic takes only a string).
     JsonText,
+    /// As OpenAI Decisions `input`: JSON text; with images, one user
+    /// message of an `input_text` part and `input_image` data URLs (read
+    /// here, as OpenAI-format bodies have no path assets).
+    OpenaiInput,
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +351,16 @@ fn build_body(obj: &Map<String, Value>, job: &Job, opts: &StreamOpts) -> Result<
         None => Value::Object(obj.clone()),
     };
     let mut body = job.template.clone();
+    if job.state_mode == StateMode::OpenaiInput {
+        let images = match opts.image_field.as_ref().and_then(|f| obj.get(f)) {
+            Some(paths) => image_data_urls(paths)?,
+            None => Vec::new(),
+        };
+        body.insert("input".into(), openai_input(state, images));
+        return Ok(Bytes::from(
+            serde_json::to_vec(&Value::Object(body)).expect("JSON serializes"),
+        ));
+    }
     if let Some(field) = &opts.image_field
         && let Some(paths) = obj.get(field)
     {
@@ -369,7 +383,7 @@ fn build_body(obj: &Map<String, Value>, job: &Job, opts: &StreamOpts) -> Result<
     }
     let state = match job.state_mode {
         StateMode::Value => state,
-        StateMode::JsonText => match state {
+        StateMode::JsonText | StateMode::OpenaiInput => match state {
             Value::String(s) => Value::String(s),
             other => Value::String(other.to_string()),
         },
@@ -378,6 +392,59 @@ fn build_body(obj: &Map<String, Value>, job: &Job, opts: &StreamOpts) -> Result<
     Ok(Bytes::from(
         serde_json::to_vec(&Value::Object(body)).expect("JSON serializes"),
     ))
+}
+
+/// OpenAI Decisions `input`: the state as text, plus image parts.
+fn openai_input(state: Value, images: Vec<String>) -> Value {
+    let text = match state {
+        Value::String(s) => s,
+        other => other.to_string(),
+    };
+    if images.is_empty() {
+        return Value::String(text);
+    }
+    let mut parts = vec![json!({"type": "input_text", "text": text})];
+    parts.extend(
+        images
+            .into_iter()
+            .map(|url| json!({"type": "input_image", "image_url": url})),
+    );
+    json!([{"role": "user", "content": parts}])
+}
+
+/// Image files named by a path or a list of paths, as data URLs.
+fn image_data_urls(paths: &Value) -> Result<Vec<String>, String> {
+    use base64::Engine;
+    let list: Vec<&str> = match paths {
+        Value::String(p) => vec![p.as_str()],
+        Value::Array(items) => items
+            .iter()
+            .map(|v| v.as_str().ok_or("image paths must be strings"))
+            .collect::<Result<_, _>>()?,
+        Value::Null => vec![],
+        _ => return Err("image field must hold a path or a list of paths".into()),
+    };
+    list.iter()
+        .map(|p| {
+            let size = std::fs::metadata(p)
+                .map_err(|e| format!("cannot read image {p}: {e}"))?
+                .len();
+            if size > crate::images::MAX_IMAGE_FILE {
+                return Err(format!(
+                    "image {p} is over {} bytes",
+                    crate::images::MAX_IMAGE_FILE
+                ));
+            }
+            let data = std::fs::read(p).map_err(|e| format!("cannot read image {p}: {e}"))?;
+            let mime = match crate::images::image_format(&data) {
+                Some("png") => "image/png",
+                Some(_) => "image/jpeg",
+                None => return Err(format!("image {p} is not PNG or JPEG")),
+            };
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+            Ok(format!("data:{mime};base64,{b64}"))
+        })
+        .collect()
 }
 
 /// Path-valued assets for image files named by a path or a list of paths.
@@ -809,6 +876,44 @@ mod tests {
         let body = build_body(obj.as_object().unwrap(), &j, &StreamOpts::default()).unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["state"], r#"{"id":1,"a":[1,2]}"#);
+    }
+
+    #[test]
+    fn openai_input_is_text_and_images_are_data_urls() {
+        let mut j = Arc::try_unwrap(job()).ok().unwrap();
+        j.state_mode = StateMode::OpenaiInput;
+        let obj = json!({"id": 1, "body": "hi"});
+        let opts = StreamOpts {
+            state_field: Some("body".into()),
+            image_field: Some("photo".into()),
+            ..Default::default()
+        };
+        let v: Value =
+            serde_json::from_slice(&build_body(obj.as_object().unwrap(), &j, &opts).unwrap())
+                .unwrap();
+        assert_eq!(v["input"], "hi");
+        assert!(v.get("state").is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n0000").unwrap();
+        let obj = json!({"id": 1, "body": "hi", "photo": png.to_str().unwrap()});
+        let v: Value =
+            serde_json::from_slice(&build_body(obj.as_object().unwrap(), &j, &opts).unwrap())
+                .unwrap();
+        let parts = &v["input"][0]["content"];
+        assert_eq!(v["input"][0]["role"], "user");
+        assert_eq!(parts[0], json!({"type": "input_text", "text": "hi"}));
+        assert!(
+            parts[1]["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+        let gif = dir.path().join("a.gif");
+        std::fs::write(&gif, b"GIF89a").unwrap();
+        let obj = json!({"body": "hi", "photo": gif.to_str().unwrap()});
+        assert!(build_body(obj.as_object().unwrap(), &j, &opts).is_err());
     }
 
     #[test]

@@ -471,3 +471,56 @@ async fn raw_passes_provider_redirects_through_unchanged() {
     );
     h.server.shutdown().await;
 }
+
+#[tokio::test]
+async fn oversize_body_is_too_long_json_with_request_id() {
+    let h = harness().await;
+    let big = vec![b' '; s1::daemon::MAX_BODY + 1];
+    for path in ["/v1/raw/systemone", "/v1/systemone"] {
+        let r = unix_post(&h, path, json_headers(), &big).await;
+        assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        assert!(r.headers.get("s1-request-id").is_some(), "{path}");
+        let v: Value = serde_json::from_slice(&r.body)
+            .unwrap_or_else(|e| panic!("{path}: {e}: {}", String::from_utf8_lossy(&r.body)));
+        assert_eq!(v["detail"]["error_type"], "too_long", "{path}");
+    }
+}
+
+// Stage 4 criterion "Errors returned in each ingress's own format": a
+// missing TCP token on a typed ingress is a 401 in that ingress's format.
+#[tokio::test]
+async fn tcp_401_uses_each_typed_ingress_error_format() {
+    let h = harness().await;
+    let client = reqwest::Client::new();
+    let post = |path: &str| {
+        client
+            .post(format!("http://{}{path}", h.server.tcp))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+    };
+    let r = post("/v1/systemone").await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    assert_eq!(r.headers()["www-authenticate"], "Bearer");
+    let v: Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(v["detail"]["error_type"], "unauthorized", "{v}");
+    assert!(
+        v["detail"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("s1 auth token")
+    );
+
+    let r = post("/v1/decisions").await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    let v: Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], "unauthorized", "{v}");
+    assert_eq!(v["error"]["type"], "authentication_error", "{v}");
+    assert_eq!(v["error"]["param"], Value::Null);
+
+    // Other endpoints keep the generic envelope.
+    let r = post("/v1/raw/systemone").await.unwrap();
+    let v: Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], "unauthorized", "{v}");
+    h.server.shutdown().await;
+}

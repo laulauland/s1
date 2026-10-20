@@ -207,7 +207,7 @@ impl<'de> Deserialize<'de> for Payload {
 }
 
 /// A question name Clef accepts: `[A-Za-z0-9_.-]`, 1 to 100 characters.
-fn strict_name(name: &str) -> bool {
+pub(crate) fn strict_name(name: &str) -> bool {
     (1..=100).contains(&name.len())
         && name
             .bytes()

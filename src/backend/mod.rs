@@ -14,6 +14,7 @@ use crate::error::S1Error;
 use crate::protocol::ProtocolId;
 use crate::secrets::{ApiKey, KeyResolver};
 
+pub mod openai;
 pub mod typesafe;
 pub mod workers_ai;
 
@@ -124,13 +125,18 @@ impl BackendContext {
 /// Build the backend for one catalog provider, if this build supports it.
 pub fn build(name: &str, provider: &Provider, ctx: &BackendContext) -> Option<Arc<dyn Backend>> {
     match (name, provider.api) {
-        // Stage 4 registers `openai`; stage 5 adds Clairic to `workers-ai`.
+        // Stage 5 adds Clairic to `workers-ai`.
         ("workers-ai", _) => Some(Arc::new(workers_ai::WorkersAi::new(
             name,
             provider.clone(),
             ctx.clone(),
         ))),
         (_, ProtocolId::Systemone) => Some(Arc::new(typesafe::TypeSafe::new(
+            name,
+            provider.clone(),
+            ctx.clone(),
+        ))),
+        (_, ProtocolId::OpenaiDecisions) => Some(Arc::new(openai::OpenAi::new(
             name,
             provider.clone(),
             ctx.clone(),

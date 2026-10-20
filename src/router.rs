@@ -10,8 +10,9 @@
 //!   throttled entry (provider pause, queue, or no room under its limits)
 //!   is skipped only when the alias sets `spill = true`; if every fitting
 //!   entry is throttled, the first one takes the request and it queues.
-//! - Formats are not translated yet (stage 4): an entry must speak the
-//!   ingress format natively.
+//! - An entry may speak another format of the same family when s1 can
+//!   translate between them ([`crate::translate::can`]); [`Route::api`] is
+//!   the format the backend gets.
 
 use std::sync::Arc;
 
@@ -33,6 +34,8 @@ pub struct Route {
     pub model_id: String,
     /// Id sent to the provider.
     pub upstream: String,
+    /// Format the backend speaks; the ingress translates when it differs.
+    pub api: ProtocolId,
     pub model: Model,
 }
 
@@ -230,11 +233,11 @@ impl Router<'_> {
                 ingress.family().as_str()
             )));
         }
-        if m.api() != ingress {
+        let api = m.api();
+        if !crate::translate::can(ingress, api) {
             return Err(S1Error::Unsupported(format!(
-                "model `{}` speaks `{}`; translation from `{ingress}` is not in this build",
+                "model `{}` speaks `{api}`; translation from `{ingress}` is not in this build",
                 m.id(),
-                m.api()
             )));
         }
         let Some(backend) = self.backends.get(m.provider_name) else {
@@ -243,9 +246,9 @@ impl Router<'_> {
                 m.provider_name
             )));
         };
-        if !backend.protocols().contains(&ingress) {
+        if !backend.protocols().contains(&api) {
             return Err(S1Error::Unsupported(format!(
-                "provider `{}` does not speak `{ingress}`",
+                "provider `{}` does not speak `{api}`",
                 m.provider_name
             )));
         }
@@ -265,6 +268,7 @@ impl Router<'_> {
             provider: m.provider_name.to_string(),
             model_id: m.id(),
             upstream: m.upstream().to_string(),
+            api: m.api(),
             model: m.model.clone(),
         })
     }
@@ -289,6 +293,18 @@ pub fn fits(
 ) -> Result<(), S1Error> {
     let model = m.model;
     let id = m.id();
+    // Translated toward OpenAI, every asset reference is one image.
+    let info = &*info.toward(m.api());
+    if m.api() == ProtocolId::OpenaiDecisions
+        && info
+            .openai_images
+            .is_some_and(|n| n as usize > crate::translate::decide::MAX_OPENAI_IMAGES)
+    {
+        return Err(S1Error::Unsupported(format!(
+            "`{id}` takes at most {} images (each asset reference counts once)",
+            crate::translate::decide::MAX_OPENAI_IMAGES
+        )));
+    }
     let tokens = match est {
         Estimate::High => info.tokens_high(),
         Estimate::Low => info.tokens_low(),
@@ -386,6 +402,16 @@ mod tests {
         available: &dyn Fn(&ModelRef<'_>) -> bool,
         throttled: &dyn Fn(&ModelRef<'_>) -> bool,
     ) -> Result<Route, S1Error> {
+        route_in(ProtocolId::Systemone, c, info, available, throttled)
+    }
+
+    fn route_in(
+        ingress: ProtocolId,
+        c: &Catalog,
+        info: &RouteInfo,
+        available: &dyn Fn(&ModelRef<'_>) -> bool,
+        throttled: &dyn Fn(&ModelRef<'_>) -> bool,
+    ) -> Result<Route, S1Error> {
         let available = |m: &ModelRef<'_>| {
             if available(m) {
                 Ok(())
@@ -404,7 +430,7 @@ mod tests {
             available: &available,
             throttled,
         }
-        .route(ProtocolId::Systemone, info, RequestFlags::default())
+        .route(ingress, info, RequestFlags::default())
     }
 
     fn route(c: &Catalog, info: &RouteInfo) -> Result<String, S1Error> {
@@ -439,9 +465,41 @@ mod tests {
         assert_eq!(e.code(), "wrong_family", "{e}");
         let e = route(&c, &info("extract")).unwrap_err();
         assert_eq!(e.code(), "wrong_family", "{e}");
-        // Same family, other format: needs translation (stage 4).
-        let e = route(&c, &info("openai/gpt-6-luna")).unwrap_err();
-        assert_eq!(e.code(), "unsupported", "{e}");
+        // Same family, other format: translated.
+        let r = route_with(&c, &info("openai/gpt-6-luna"), &|_| true).unwrap();
+        assert_eq!(r.api, ProtocolId::OpenaiDecisions);
+        assert_eq!(r.upstream, "gpt-6-luna");
+    }
+
+    #[test]
+    fn openai_ingress_routes_through_translation() {
+        let c = Catalog::builtin();
+        let all = |_: &ModelRef<'_>| true;
+        let none = |_: &ModelRef<'_>| false;
+        let r = |i: &RouteInfo| route_in(ProtocolId::OpenaiDecisions, &c, i, &all, &none);
+        // The decide alias reaches Clef (systemone) through translation.
+        let clef = r(&info("decide")).unwrap();
+        assert_eq!(clef.model_id, "workers-ai/clef-flash");
+        assert_eq!(clef.api, ProtocolId::Systemone);
+        // Images from `input` are systemone assets: Clef takes none.
+        let assets = RouteInfo {
+            assets: 1,
+            ..info("decide")
+        };
+        assert_eq!(r(&assets).unwrap().model_id, "typesafe/jev-latest");
+        // Native OpenAI needs no translation.
+        let native = r(&info("openai/gpt-6-luna")).unwrap();
+        assert_eq!(native.api, ProtocolId::OpenaiDecisions);
+        // More than 10 score levels: no systemone model takes them.
+        let levels = RouteInfo {
+            max_levels: Some(11),
+            min_levels: Some(11),
+            ..info("decide")
+        };
+        assert_eq!(r(&levels).unwrap_err().code(), "unsupported");
+        // Other families stay wrong.
+        let e = r(&info("workers-ai/clairic")).unwrap_err();
+        assert_eq!(e.code(), "wrong_family");
     }
 
     #[test]
@@ -776,5 +834,36 @@ mod tests {
         let e = run(&mixed, "cf");
         assert_eq!(e.code(), "backend_unavailable");
         assert_eq!(e.retry_after(), None, "{e}");
+    }
+    // Review R3-4.2: toward OpenAI each asset reference is one image.
+    #[test]
+    fn asset_references_count_per_occurrence_toward_openai() {
+        let c = Catalog::with_overlay_str(
+            "[aliases.mix]\nmodels = [\"openai/gpt-6-luna\", \"typesafe/jev-latest\"]\n",
+        )
+        .unwrap();
+        let refs = |n: u32| RouteInfo {
+            assets: 1,
+            openai_images: Some(n),
+            ..info("mix")
+        };
+        assert_eq!(route(&c, &refs(128)).unwrap(), "openai/gpt-6-luna");
+        // Over OpenAI's 128 images: the alias skips it, a named model fails.
+        assert_eq!(route(&c, &refs(129)).unwrap(), "typesafe/jev-latest");
+        let named = RouteInfo {
+            model: "openai/gpt-6-luna".into(),
+            ..refs(129)
+        };
+        assert_eq!(route(&c, &named).unwrap_err().code(), "unsupported");
+        // Context and cost: one image allowance per occurrence.
+        let i = refs(128);
+        assert_eq!(
+            i.toward(ProtocolId::OpenaiDecisions).image_tokens(),
+            128 * crate::protocol::TOKENS_PER_IMAGE_MAX
+        );
+        assert_eq!(
+            i.toward(ProtocolId::Systemone).image_tokens(),
+            crate::protocol::TOKENS_PER_IMAGE_MAX
+        );
     }
 }

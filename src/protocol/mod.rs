@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::error::S1Error;
 
+pub mod openai_decisions;
 pub mod systemone;
 
 /// Model family. The endpoint fixes the family.
@@ -112,6 +113,11 @@ pub struct RouteInfo {
     pub assets: u32,
     /// Images sent as an array (Clef `images` extension, Clairic `images`).
     pub images: u32,
+    /// Images a systemone request with `assets` becomes toward OpenAI
+    /// Decisions: one per asset reference plus `images`, counted up to one
+    /// over the OpenAI limit (`None`: not measured, or no `assets`). See
+    /// [`RouteInfo::toward`].
+    pub openai_images: Option<u32>,
     /// A question type that only some models have (systemone `box`).
     pub has_box: bool,
     /// A question whose `instructions` are missing, null, or a blank
@@ -135,6 +141,19 @@ pub const BYTES_PER_TOKEN_LENIENT: usize = 4;
 pub const TOKENS_PER_IMAGE_MAX: u64 = 1_024 + 3;
 
 impl RouteInfo {
+    /// The facts as a backend that speaks `api` gets the request: toward
+    /// OpenAI Decisions each asset reference is one image (spec
+    /// "Translation rules"), so a systemone asset referenced many times
+    /// costs, and counts against context, once per reference.
+    pub fn toward(&self, api: ProtocolId) -> std::borrow::Cow<'_, RouteInfo> {
+        match self.openai_images {
+            Some(n) if api == ProtocolId::OpenaiDecisions => std::borrow::Cow::Owned(RouteInfo {
+                assets: n.saturating_sub(self.images),
+                ..self.clone()
+            }),
+            _ => std::borrow::Cow::Borrowed(self),
+        }
+    }
     /// Input tokens of the images, at most [`TOKENS_PER_IMAGE_MAX`] each.
     pub fn image_tokens(&self) -> u64 {
         u64::from(self.assets.saturating_add(self.images)) * TOKENS_PER_IMAGE_MAX
@@ -185,6 +204,7 @@ pub trait Protocol: Send + Sync {
 pub fn by_id(id: ProtocolId) -> Option<&'static dyn Protocol> {
     match id {
         ProtocolId::Systemone => Some(&systemone::Systemone),
+        ProtocolId::OpenaiDecisions => Some(&openai_decisions::OpenaiDecisions),
         _ => None,
     }
 }
