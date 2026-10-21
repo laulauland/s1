@@ -80,7 +80,7 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        let _ = self.run(&["daemon", "stop"], b"");
+        let _ = self.run(&["util", "daemon", "stop"], b"");
     }
 }
 
@@ -353,7 +353,7 @@ fn cache_status_and_cache_clear_commands() {
     );
     assert!(!table.contains(CF_TOKEN) && !table.contains(TEST_KEY));
 
-    let out = env.ok(&["cache", "clear"], b"");
+    let out = env.ok(&["util", "cache", "clear"], b"");
     assert!(
         text(&out.stdout).contains("cleared 1"),
         "{}",
@@ -363,10 +363,10 @@ fn cache_status_and_cache_clear_commands() {
     assert_eq!(env.mocks.clef.all().len(), calls + 2, "cleared: asks again");
 
     // Without a daemon the file is removed.
-    env.ok(&["daemon", "stop"], b"");
+    env.ok(&["util", "daemon", "stop"], b"");
     let file = env.root().join("cache/s1/cache.redb");
     assert!(file.exists());
-    let out = env.ok(&["cache", "clear"], b"");
+    let out = env.ok(&["util", "cache", "clear"], b"");
     assert!(
         text(&out.stdout).contains("removed"),
         "{}",

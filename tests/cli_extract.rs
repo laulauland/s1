@@ -86,7 +86,7 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        let _ = self.run(&["daemon", "stop"], b"");
+        let _ = self.run(&["util", "daemon", "stop"], b"");
     }
 }
 

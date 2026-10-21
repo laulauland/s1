@@ -1,4 +1,4 @@
-//! `s1 raw <protocol> < body.json`: pure passthrough through the daemon.
+//! `s1 util raw <protocol> < body.json`: pure passthrough through the daemon.
 
 use std::io::{Read, Write};
 use std::process::ExitCode;

@@ -1,4 +1,4 @@
-//! `s1 daemon start|stop|logs` (and the hidden `run`, the daemon itself).
+//! `s1 util daemon start|stop|logs` (and the hidden `run`, the daemon itself).
 
 use std::io::Write;
 use std::process::ExitCode;

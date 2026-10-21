@@ -104,10 +104,10 @@ Environment variables override the file: `TYPESAFE_API_KEY`,
 The CLI starts the daemon on first use. MCP and HTTP clients need it running:
 
 ```sh
-s1 daemon start      # Unix socket for the CLI, http://127.0.0.1:7341 for everything else
-s1 status            # queues, limits, breakers, cache size
-s1 models            # models, aliases, availability
-s1 daemon logs
+s1 util daemon start   # Unix socket for the CLI, http://127.0.0.1:7341 for everything else
+s1 status              # queues, limits, breakers, cache size
+s1 models              # models, aliases, availability
+s1 util daemon logs
 ```
 
 ### Add it to your agent (MCP)
@@ -353,7 +353,7 @@ read every item itself, or where you want a score, not an opinion. Some ideas:
 | `~/.s1/auth.json` | Provider keys and the local bearer token (mode 0600) |
 | `~/.config/s1/config.toml` | Listener address, queue sizes, cache size, log level |
 | `~/.config/s1/models.toml` | Your providers, models, aliases, and rate limits |
-| `~/.cache/s1/cache.redb` | Response cache (`s1 cache clear`) |
+| `~/.cache/s1/cache.redb` | Response cache (`s1 util cache clear`) |
 | `~/.local/state/s1/` | Logs (7 days), PID, last resolved model versions |
 | `$XDG_RUNTIME_DIR/s1.sock` | Unix socket for the CLI (mode 0600) |
 

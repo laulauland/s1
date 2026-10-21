@@ -81,7 +81,7 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        let _ = self.run(&["daemon", "stop"], b"");
+        let _ = self.run(&["util", "daemon", "stop"], b"");
     }
 }
 
@@ -170,12 +170,12 @@ fn daemon_lifecycle_models_raw_and_logs() {
     assert!(json["data"].as_array().unwrap().len() >= 6);
 
     // `daemon start` sees the running daemon.
-    let out = env.ok(&["daemon", "start"], b"");
+    let out = env.ok(&["util", "daemon", "start"], b"");
     assert!(text(&out.stdout).contains("already running"));
 
     // `raw systemone` passes bytes both ways unchanged.
     let body = fixture("typesafe/noul.request.json");
-    let out = env.ok(&["raw", "systemone", "-i"], &body);
+    let out = env.ok(&["util", "raw", "systemone", "-i"], &body);
     assert_eq!(out.stdout, fixture("typesafe/noul.response.json"));
     let headers = text(&out.stderr);
     assert!(headers.contains("HTTP 200"), "{headers}");
@@ -218,12 +218,12 @@ fn daemon_lifecycle_models_raw_and_logs() {
     )
     .unwrap();
     std::fs::set_permissions(env.auth_file(), std::fs::Permissions::from_mode(0o600)).unwrap();
-    let out = env.run(&["raw", "systemone"], &body);
+    let out = env.run(&["util", "raw", "systemone"], &body);
     assert!(!out.status.success());
     assert_eq!(out.stdout, fixture("typesafe/invalid_key.401.json"));
 
     // JSON logs with metadata, no payloads or keys.
-    let out = env.ok(&["daemon", "logs", "-n", "100"], b"");
+    let out = env.ok(&["util", "daemon", "logs", "-n", "100"], b"");
     let logs = text(&out.stdout);
     let lines: Vec<Value> = logs
         .lines()
@@ -243,11 +243,11 @@ fn daemon_lifecycle_models_raw_and_logs() {
     assert_eq!(log_files.len(), 1);
 
     // Stop.
-    let out = env.ok(&["daemon", "stop"], b"");
+    let out = env.ok(&["util", "daemon", "stop"], b"");
     assert!(text(&out.stdout).contains("stopped"));
     assert!(!env.socket().exists());
     assert!(!env.state_dir().join("daemon.json").exists());
-    let out = env.ok(&["daemon", "stop"], b"");
+    let out = env.ok(&["util", "daemon", "stop"], b"");
     assert!(text(&out.stdout).contains("not running"));
 }
 
@@ -256,7 +256,7 @@ fn raw_auto_starts_daemon() {
     let env = Env::new();
     env.ok(&["auth", "set", "typesafe"], TEST_KEY.as_bytes());
     let out = env.ok(
-        &["raw", "systemone"],
+        &["util", "raw", "systemone"],
         &fixture("typesafe/noul.request.json"),
     );
     assert_eq!(out.stdout, fixture("typesafe/noul.response.json"));
@@ -282,7 +282,7 @@ fn bad_overlay_reports_daemon_start_error() {
 #[test]
 fn daemon_stop_signals_the_daemon_not_a_stale_pid() {
     let env = Env::new();
-    env.ok(&["daemon", "start"], b"");
+    env.ok(&["util", "daemon", "start"], b"");
     // Stale metadata naming an unrelated live process.
     let mut bystander = Command::new("sleep").arg("30").spawn().unwrap();
     let file = env.state_dir().join("daemon.json");
@@ -290,7 +290,7 @@ fn daemon_stop_signals_the_daemon_not_a_stale_pid() {
     info["pid"] = bystander.id().into();
     std::fs::write(&file, serde_json::to_vec(&info).unwrap()).unwrap();
 
-    let out = env.run(&["daemon", "stop"], b"");
+    let out = env.run(&["util", "daemon", "stop"], b"");
     let alive = bystander.try_wait().unwrap().is_none();
     let _ = bystander.kill();
     let _ = bystander.wait();
@@ -318,13 +318,13 @@ fn fallback_socket_dir_is_private_under_permissive_umask() {
         }
         c.output().unwrap()
     };
-    let out = fallback(&["daemon", "start"]);
+    let out = fallback(&["util", "daemon", "start"]);
     let socket = env.state_dir().join("s1.sock");
     let modes = (
         mode(&env.state_dir()),
         socket.exists().then(|| mode(&socket)),
     );
-    let stop = fallback(&["daemon", "stop"]);
+    let stop = fallback(&["util", "daemon", "stop"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(stop.status.success(), "{}", text(&stop.stderr));
     assert_eq!(modes, (0o700, Some(0o600)));
@@ -338,7 +338,7 @@ fn existing_open_socket_dir_is_made_private() {
     let run = env.root().join("run");
     std::fs::create_dir_all(&run).unwrap();
     std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o777)).unwrap();
-    env.ok(&["daemon", "start"], b"");
+    env.ok(&["util", "daemon", "start"], b"");
     assert_eq!(mode(&run), 0o700);
     assert_eq!(mode(&env.socket()), 0o600);
 }
@@ -349,7 +349,7 @@ fn existing_open_socket_dir_is_made_private() {
 fn symlinked_socket_is_not_trusted() {
     let env = Env::new();
     let other = Env::new();
-    other.ok(&["daemon", "start"], b"");
+    other.ok(&["util", "daemon", "start"], b"");
     let run = env.root().join("run");
     std::fs::create_dir_all(&run).unwrap();
     std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -361,11 +361,51 @@ fn symlinked_socket_is_not_trusted() {
         "{}",
         text(&out.stderr)
     );
-    let start = env.run(&["daemon", "run"], b"");
+    let start = env.run(&["util", "daemon", "run"], b"");
     assert!(!start.status.success());
     assert!(
         text(&start.stderr).contains("symlink"),
         "{}",
         text(&start.stderr)
+    );
+}
+
+/// `raw`, `cache` and `daemon` live under `s1 util`; the old top-level
+/// commands are gone.
+#[test]
+fn util_holds_raw_cache_and_daemon() {
+    let env = Env::new();
+    let out = env.ok(&["util", "daemon", "start"], b"");
+    assert!(
+        text(&out.stdout).contains("started"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(env.socket().exists());
+    let out = env.ok(&["util", "daemon", "stop"], b"");
+    assert!(
+        text(&out.stdout).contains("stopped"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(!env.socket().exists());
+
+    for old in [
+        &["daemon", "start"][..],
+        &["raw", "systemone"],
+        &["cache", "clear"],
+    ] {
+        let out = env.run(old, b"");
+        assert!(!out.status.success(), "s1 {old:?} still works");
+        assert!(!env.socket().exists(), "s1 {old:?} started the daemon");
+    }
+
+    env.ok(&["util", "raw", "--help"], b"");
+    env.ok(&["util", "cache", "--help"], b"");
+    env.ok(&["util", "daemon", "--help"], b"");
+    let help = text(&env.ok(&["util", "--help"], b"").stdout);
+    assert!(
+        help.contains("raw") && help.contains("cache") && help.contains("daemon"),
+        "{help}"
     );
 }

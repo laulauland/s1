@@ -104,7 +104,7 @@ pub fn ensure_daemon(paths: &Paths) -> Result<bool, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find s1 binary: {e}"))?;
     use std::os::unix::process::CommandExt;
     let mut child = Command::new(exe)
-        .args(["daemon", "run"])
+        .args(["util", "daemon", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)

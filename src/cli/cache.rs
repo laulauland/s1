@@ -1,4 +1,4 @@
-//! `s1 cache clear`: remove every cached response. Through the daemon when
+//! `s1 util cache clear`: remove every cached response. Through the daemon when
 //! it runs (it holds the store open); else the store file is deleted.
 
 use std::process::ExitCode;

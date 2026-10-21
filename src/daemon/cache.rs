@@ -1,4 +1,4 @@
-//! `POST /cache/clear`: remove every cached response (`s1 cache clear`).
+//! `POST /cache/clear`: remove every cached response (`s1 util cache clear`).
 
 use axum::extract::State;
 use axum::http::StatusCode;

@@ -28,13 +28,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Start, stop, or inspect the daemon.
-    Daemon {
-        #[command(subcommand)]
-        cmd: daemon::DaemonCmd,
-    },
-    /// Send stdin to a provider unchanged and print its response unchanged.
-    Raw(raw::RawArgs),
     /// List models, aliases, and their state.
     Models(models::ModelsArgs),
     /// Ask Decide questions: one text, or one JSON line in, one line out.
@@ -45,15 +38,31 @@ enum Cmd {
     Forecast(forecast::ForecastArgs),
     /// Queues, limits, and breakers per backend; cache size.
     Status(status::StatusArgs),
+    /// Manage provider keys in ~/.s1/auth.json.
+    Auth {
+        #[command(subcommand)]
+        cmd: auth::AuthCmd,
+    },
+    /// Low-level tools: raw provider calls, the response cache, and the daemon.
+    Util {
+        #[command(subcommand)]
+        cmd: UtilCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum UtilCmd {
+    /// Send stdin to a provider unchanged and print its response unchanged.
+    Raw(raw::RawArgs),
     /// Manage the response cache.
     Cache {
         #[command(subcommand)]
         cmd: cache::CacheCmd,
     },
-    /// Manage provider keys in ~/.s1/auth.json.
-    Auth {
+    /// Start, stop, or inspect the daemon.
+    Daemon {
         #[command(subcommand)]
-        cmd: auth::AuthCmd,
+        cmd: daemon::DaemonCmd,
     },
 }
 
@@ -62,15 +71,17 @@ pub fn main() -> ExitCode {
     let cli = Cli::parse();
     let paths = Paths::from_env();
     let result = match cli.cmd {
-        Cmd::Daemon { cmd } => daemon::run(cmd, &paths),
-        Cmd::Raw(args) => raw::run(args, &paths),
         Cmd::Models(args) => models::run(args, &paths),
         Cmd::Auth { cmd } => auth::run(cmd, &paths),
         Cmd::Decide(args) => decide::run(args, &paths),
         Cmd::Extract(args) => extract::run(args, &paths),
         Cmd::Forecast(args) => forecast::run(args, &paths),
         Cmd::Status(args) => status::run(args, &paths),
-        Cmd::Cache { cmd } => cache::run(cmd, &paths),
+        Cmd::Util { cmd } => match cmd {
+            UtilCmd::Raw(args) => raw::run(args, &paths),
+            UtilCmd::Cache { cmd } => cache::run(cmd, &paths),
+            UtilCmd::Daemon { cmd } => daemon::run(cmd, &paths),
+        },
     };
     match result {
         Ok(code) => code,
@@ -102,12 +113,13 @@ mod tests {
     #[test]
     fn parses_all_subcommands() {
         for args in [
-            &["s1", "daemon", "start"][..],
-            &["s1", "daemon", "stop"],
-            &["s1", "daemon", "logs", "-n", "5"],
-            &["s1", "raw", "systemone"],
+            &["s1", "util", "daemon", "start"][..],
+            &["s1", "util", "daemon", "stop"],
+            &["s1", "util", "daemon", "logs", "-n", "5"],
+            &["s1", "util", "raw", "systemone"],
             &[
                 "s1",
+                "util",
                 "raw",
                 "systemone",
                 "--provider",
@@ -122,7 +134,7 @@ mod tests {
             &["s1", "auth", "token"],
             &["s1", "status"],
             &["s1", "status", "--json"],
-            &["s1", "cache", "clear"],
+            &["s1", "util", "cache", "clear"],
             &["s1", "decide", "-t", "t.json", "--no-cache", "text"],
             &["s1", "decide", "-t", "t.json", "text"],
             &["s1", "decide", "--openai", "-t", "t.json", "text"],
@@ -198,5 +210,17 @@ mod tests {
         ] {
             Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }
+    }
+
+    #[test]
+    fn old_top_level_commands_are_gone() {
+        for args in [
+            &["s1", "daemon", "start"][..],
+            &["s1", "raw", "systemone"],
+            &["s1", "cache", "clear"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+        }
+        Cli::try_parse_from(["s1", "util", "daemon", "run"]).unwrap();
     }
 }

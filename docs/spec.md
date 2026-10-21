@@ -43,7 +43,7 @@ The forecast ingress exists in v1 so that the format is reserved, but it has no 
 - **Unix socket** (`$XDG_RUNTIME_DIR/s1.sock`, mode 0600) for the CLI. File permissions give access control.
 - **TCP on 127.0.0.1** for MCP clients and HTTP SDKs, because most MCP clients accept only `http://` URLs. Requests need the local bearer token from the auth file.
 - One `axum` router serves both listeners.
-- The CLI starts the daemon on first use if it is not running (`s1 daemon start` also exists).
+- The CLI starts the daemon on first use if it is not running (`s1 util daemon start` also exists).
 
 **Large inputs**
 
@@ -313,8 +313,8 @@ s1 extract  -t invoice.clairic.json < invoice.txt
 s1 forecast -m <model> --csv sales.csv --id sku --time ds --value y -h 28
 s1 models
 s1 status
-s1 raw systemone < body.json          # pure passthrough
-s1 daemon start|stop|logs
+s1 util raw systemone < body.json     # pure passthrough
+s1 util daemon start|stop|logs
 ```
 
 **Streaming filter mode** (when stdin is not a terminal, or with `--jsonl`):
@@ -399,8 +399,8 @@ No request payloads are stored. The cache keeps only key hashes and responses; l
 
 - Store: one embedded key-value file (`redb` or SQLite) in `~/.cache/s1/`.
 - Entry: key hash (see Model catalog and routing) → response bytes + resolved model + time.
-- Size cap (default 1 GiB) with LRU eviction. No TTL by default; `--no-cache` per request and `s1 cache clear`.
-- As built: `~/.cache/s1/cache.redb`; `[cache] enabled` and `max_bytes` in `config.toml`; `POST /cache/clear` on the daemon. `max_bytes` caps the file on disk: stored responses get 3/4 of it, each charged 256 bytes for its keys and index rows (the rest is room for redb pages and freed space), the file is compacted when it grows past the cap (plus 2 MiB for the fixed size of an empty redb file) and, if it is still over, the oldest entries go until it fits, and `s1 cache clear` and a daemon start with a lower cap evict and compact at once. `/status` reports `bytes` (responses plus the per-entry charge) and `file_bytes`. The key also holds the long-context opt-in. Last resolved versions are in `~/.local/state/s1/versions.json`.
+- Size cap (default 1 GiB) with LRU eviction. No TTL by default; `--no-cache` per request and `s1 util cache clear`.
+- As built: `~/.cache/s1/cache.redb`; `[cache] enabled` and `max_bytes` in `config.toml`; `POST /cache/clear` on the daemon. `max_bytes` caps the file on disk: stored responses get 3/4 of it, each charged 256 bytes for its keys and index rows (the rest is room for redb pages and freed space), the file is compacted when it grows past the cap (plus 2 MiB for the fixed size of an empty redb file) and, if it is still over, the oldest entries go until it fits, and `s1 util cache clear` and a daemon start with a lower cap evict and compact at once. `/status` reports `bytes` (responses plus the per-entry charge) and `file_bytes`. The key also holds the long-context opt-in. Last resolved versions are in `~/.local/state/s1/versions.json`.
 - Only successful responses are cached. Partial results (a refused question) are cached as returned.
 
 **Logging**
@@ -471,7 +471,7 @@ Property tests with `proptest` carry most of the weight. Example tests and recor
 
 Each milestone ends with something usable from the shell.
 
-1. **Skeleton:** daemon on Unix socket and TCP, catalog loading, auth file, `s1 raw` passthrough to TypeSafe, logs.
+1. **Skeleton:** daemon on Unix socket and TCP, catalog loading, auth file, `s1 raw` passthrough (now `s1 util raw`) to TypeSafe, logs.
 2. **Decide:** systemone ingress, Jev and Clef backends, router with aliases, `s1 decide` single and streaming, `--flat`.
 3. **Protection:** limiters, AIMD, retries, breaker, bounded queues with two lanes, `/status`, cache. Property tests for all of these.
 4. **OpenAI Decisions:** ingress and backend, translation both ways, SDK conformance tests.
