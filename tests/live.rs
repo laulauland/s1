@@ -553,7 +553,9 @@ async fn live_mcp_decide_and_extract_lists() {
 
 /// TSFM.ai forecast through a `tsfm` provider from the overlay. Needs a
 /// `tsfm` key (`TSFM_API_KEY` or `~/.s1/auth.json`); there is none in v1,
-/// so this normally skips.
+/// so this normally skips. `S1_LIVE_TSFM_BASE_URL` and
+/// `S1_LIVE_TSFM_UPSTREAM` point it at another TSFM-compatible server, for
+/// example a local Timestral worker.
 #[tokio::test]
 #[ignore = "live: needs S1_LIVE=1 and a TSFM.ai key"]
 async fn live_forecast_tsfm_tiny_request() {
@@ -573,10 +575,14 @@ async fn live_forecast_tsfm_tiny_request() {
         (name == "TSFM_API_KEY").then(|| key.clone())
     });
     let token = keys.ensure_local_token().unwrap();
-    let catalog = Catalog::with_overlay_str(
-        "[providers.tsfm]\nbase_url = \"https://api.tsfm.ai\"\napi = \"tsfm\"\n\
-         [[providers.tsfm.models]]\nid = \"chronos-bolt-small\"\nupstream = \"amazon/chronos-bolt-small\"\n",
-    )
+    let base_url =
+        std::env::var("S1_LIVE_TSFM_BASE_URL").unwrap_or_else(|_| "https://api.tsfm.ai".into());
+    let upstream = std::env::var("S1_LIVE_TSFM_UPSTREAM")
+        .unwrap_or_else(|_| "amazon/chronos-bolt-small".into());
+    let catalog = Catalog::with_overlay_str(&format!(
+        "[providers.tsfm]\nbase_url = {base_url:?}\napi = \"tsfm\"\n\
+         [[providers.tsfm.models]]\nid = \"chronos-bolt-small\"\nupstream = {upstream:?}\n",
+    ))
     .unwrap();
     let _server = serve(ServerOptions {
         socket: paths.socket.clone(),
