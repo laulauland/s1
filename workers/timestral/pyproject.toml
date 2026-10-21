@@ -1,0 +1,31 @@
+[project]
+name = "s1-timestral"
+version = "0.1.0"
+description = "Local TSFM.ai-compatible forecast server for Timestral, used as an s1 backend"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.156.7",
+    "pandas>=3.0.6",
+    "timestral",
+    "torch>=2.4",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+s1-timestral = "s1_timestral:main"
+
+[build-system]
+requires = ["uv_build>=0.9"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+timestral = { git = "https://github.com/mistralai/timestral.git" }
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[dependency-groups]
+dev = ["pytest>=8", "httpx>=0.27"]
