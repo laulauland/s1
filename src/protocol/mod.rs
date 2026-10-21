@@ -179,6 +179,15 @@ impl RouteInfo {
             .saturating_add(self.max_question_bytes);
         bytes.div_ceil(BYTES_PER_TOKEN_SAFE) as u64 + self.image_tokens()
     }
+    /// Input tokens one question sees, estimated low: text bytes of the
+    /// request without the other questions, no images.
+    pub fn question_tokens_low(&self) -> u64 {
+        let bytes = self
+            .input_bytes
+            .saturating_sub(self.questions_bytes)
+            .saturating_add(self.max_question_bytes);
+        (bytes / BYTES_PER_TOKEN_LENIENT) as u64
+    }
     /// Input tokens, estimated low (a request above this surely fails).
     /// Text bytes only: an image can cost as little as 64 tokens, and the
     /// Workers AI pre-check does not count image bytes (live, 2026-10-20).

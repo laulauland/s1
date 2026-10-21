@@ -108,6 +108,7 @@ pub fn env_vars(provider: &str) -> (Option<&'static str>, Option<&'static str>) 
         "workers-ai" => (Some("CLOUDFLARE_API_TOKEN"), Some("CLOUDFLARE_ACCOUNT_ID")),
         "openai" => (Some("OPENAI_API_KEY"), None),
         "tsfm" => (Some("TSFM_API_KEY"), None),
+        "baseten" => (Some("BASETEN_API_KEY"), None),
         _ => (None, None),
     }
 }

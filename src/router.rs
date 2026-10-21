@@ -340,6 +340,21 @@ pub fn fits(
                 "request is about {tokens} tokens; `{id}` takes {ctx}"
             )));
         }
+        // A per-question limit with no opt-in to raise it (Baseten: 32k
+        // for the state plus one question). Jev's opt-in covers it.
+        if let Some(ctx) = model.question_context_tokens
+            && model.long_context_tokens.is_none()
+        {
+            let tokens = match est {
+                Estimate::High => info.question_tokens_high(),
+                Estimate::Low => info.question_tokens_low(),
+            };
+            if tokens > ctx {
+                return Err(S1Error::TooLong(format!(
+                    "one question sees about {tokens} tokens; `{id}` takes {ctx} per question"
+                )));
+            }
+        }
     }
     let unsupported = |what: String| Err(S1Error::Unsupported(format!("`{id}` {what}")));
     if info.assets > 0 && (model.images == Images::None || !model.compat_flag("assets", true)) {
@@ -613,6 +628,37 @@ mod tests {
             ..info("decide")
         };
         assert_eq!(route(&c, &huge).unwrap_err().code(), "too_long");
+    }
+
+    #[test]
+    fn baseten_limits_each_question_not_the_request() {
+        let c = Catalog::builtin();
+        // Four questions of about 20k tokens each: about 80k in all, but
+        // each prompt (state plus one question) is about 20k.
+        let wide = RouteInfo {
+            input_bytes: 330_000,
+            questions: 4,
+            questions_bytes: 320_000,
+            max_question_bytes: 80_000,
+            ..info("baseten/mammoth-1")
+        };
+        assert!(route(&c, &wide).is_ok());
+        // One question of about 35k tokens: over 32,768.
+        let deep = RouteInfo {
+            input_bytes: 140_000,
+            questions_bytes: 1_000,
+            max_question_bytes: 1_000,
+            ..info("baseten/mammoth-1")
+        };
+        let e = route(&c, &deep).unwrap_err();
+        assert_eq!(e.code(), "too_long");
+        assert!(e.to_string().contains("per question"), "{e}");
+        // Jev's long-context opt-in covers its own per-question limit.
+        let jev = RouteInfo {
+            model: "typesafe/jev-latest".into(),
+            ..deep
+        };
+        assert!(route(&c, &jev).is_ok());
     }
 
     #[test]

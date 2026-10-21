@@ -19,7 +19,7 @@ $ s1 decide -t commit.json "bump tokio to 1.54 and fix clippy warnings"
 ## Why this exists
 
 New System One models keep appearing: TypeSafe Jev, Cloudflare Clef and Clairic,
-OpenAI Decisions (`gpt-6-luna`). Each one has its own API, key, limits, and quirks.
+OpenAI Decisions (`gpt-6-luna`), and the baselabs models on Baseten. Each one has its own API, key, limits, and quirks.
 Trying a new one usually means a new SDK and a throwaway script, and then you forget
 about it.
 
@@ -40,7 +40,7 @@ s1 removes that cost:
 
 | Family | Question it answers | Output | Models (built in) |
 | --- | --- | --- | --- |
-| **Decide** | Yes/no, pick one of N, score on a scale | Probabilities and confidence | `workers-ai/clef`, `workers-ai/clef-flash`, `typesafe/jev-latest`, `typesafe/jev-preview`, `openai/gpt-6-luna` |
+| **Decide** | Yes/no, pick one of N, score on a scale | Probabilities and confidence | `workers-ai/clef`, `workers-ai/clef-flash`, `typesafe/jev-latest`, `typesafe/jev-preview`, `openai/gpt-6-luna`, `baseten/mammoth-1`, `baseten/elephant-1` |
 | **Extract** | "What is the total, the date, the vendor?" | Typed values with confidence, spans, and estimates (p10 / median / p90) | `workers-ai/clairic` |
 | **Forecast** | "What comes next in this series?" | Quantile forecasts | None built in; add any TSFM.ai-compatible server |
 
@@ -93,11 +93,12 @@ s1 reads keys from `~/.s1/auth.json` (mode 0600). Add the providers you have:
 s1 auth set typesafe                          # TypeSafe Jev
 s1 auth set workers-ai --account-id <id>      # Cloudflare Clef and Clairic
 s1 auth set openai                            # OpenAI Decisions
+s1 auth set baseten                           # Baseten (baselabs mammoth-1, elephant-1)
 s1 auth list
 ```
 
 Environment variables override the file: `TYPESAFE_API_KEY`,
-`CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID`, `OPENAI_API_KEY`, `TSFM_API_KEY`.
+`CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID`, `OPENAI_API_KEY`, `BASETEN_API_KEY`, `TSFM_API_KEY`.
 
 ### Daemon
 

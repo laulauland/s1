@@ -1,12 +1,12 @@
 //! Live smoke tests against the real providers (TypeSafe, Workers AI Clef
-//! and Clairic, OpenAI). Manual and opt-in:
+//! and Clairic, OpenAI, Baseten). Manual and opt-in:
 //!
 //! ```sh
 //! S1_LIVE=1 cargo test --test live -- --ignored
 //! ```
 //!
 //! Keys come from `TYPESAFE_API_KEY`, `CLOUDFLARE_API_TOKEN` and
-//! `CLOUDFLARE_ACCOUNT_ID`, `OPENAI_API_KEY`, or `~/.s1/auth.json` (read
+//! `CLOUDFLARE_ACCOUNT_ID`, `OPENAI_API_KEY`, `BASETEN_API_KEY`, or `~/.s1/auth.json` (read
 //! only). Without `S1_LIVE=1` or without a key, the test skips.
 //! `S1_RECORD=1` saves some answers as fixtures (never keys).
 
@@ -101,6 +101,7 @@ async fn live_server_with(
         match *p {
             "typesafe" => env.push(("TYPESAFE_API_KEY", k.key.expose().to_string())),
             "openai" => env.push(("OPENAI_API_KEY", k.key.expose().to_string())),
+            "baseten" => env.push(("BASETEN_API_KEY", k.key.expose().to_string())),
             "workers-ai" => {
                 let Some(acc) = k.account_id.clone() else {
                     eprintln!("skip: no Cloudflare account id");
@@ -613,4 +614,41 @@ async fn live_forecast_tsfm_tiny_request() {
     record("tsfm/live.response.json", &reply.body);
     let rows = s1::protocol::tsfm::flatten_rows(&reply.body).unwrap();
     assert_eq!(rows.len(), 3);
+}
+
+/// Both baselabs models on Baseten, each with a text state and a JSON state
+/// (sent as text: `string_state`).
+#[tokio::test]
+#[ignore = "live: needs S1_LIVE=1 and a Baseten key"]
+async fn live_systemone_baseten_mammoth_and_elephant() {
+    let Some((_dir, paths, server)) = live_server(&["baseten"]).await else {
+        return;
+    };
+    let mut replies = Vec::new();
+    for model in ["baseten/mammoth-1", "baseten/elephant-1"] {
+        let text: Value = serde_json::from_str(&TRIAGE.replace("MODEL", model)).unwrap();
+        let mut json_state = text.clone();
+        json_state["state"] =
+            serde_json::json!({"ticket": text["state"], "customers_affected": "all"});
+        for body in [text, json_state] {
+            let reply = post_systemone(&paths, &serde_json::to_vec(&body).unwrap()).await;
+            replies.push((model, reply));
+        }
+    }
+    server.shutdown().await;
+    for (model, reply) in replies {
+        assert_eq!(
+            reply.status.as_u16(),
+            200,
+            "{model}: {}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        assert_eq!(reply.headers["s1-model"], model);
+        let v: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(v["answers"]["team"]["choice"], "technical", "{model}: {v}");
+        assert!(
+            v["answers"]["urgent"]["noul"].as_f64().unwrap() > 0.5,
+            "{model}: {v}"
+        );
+    }
 }

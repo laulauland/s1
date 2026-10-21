@@ -1,7 +1,8 @@
-# Compiled-in catalog for the four v1 backends.
+# Compiled-in catalog for the v1 backends.
 # Users add or override any field in ~/.config/s1/models.toml.
 # Model IDs are `provider/model`. Sources: /docs/spec.md and provider docs
-# (TypeSafe models page, Workers AI Clef/Clairic pages, OpenAI gpt-6-luna page).
+# (TypeSafe models page, Workers AI Clef/Clairic pages, OpenAI gpt-6-luna page,
+# Baseten decision-models page).
 
 [providers.typesafe]
 base_url = "https://api.typesafe.ai"
@@ -93,6 +94,40 @@ images = "yes"
 # `input_image` parts; `box` has no OpenAI form.
 compat = { noul_confidence = false, images_array = true, box = false }
 
+# Baseten Model APIs for the baselabs decision models (Qwen3.5 fine-tunes,
+# hf.co/baselabs). Docs: docs.baseten.co/reference/inference-api/system-one.
+# Live (2026-10-22): one prompt (the state plus one question) takes at most
+# 32768 tokens; the whole request has no token limit of its own (4 questions
+# of 20k tokens pass). Baseten itself refuses (422) a state over 50000
+# characters and over 512 options in one request (a noul counts 2). Text
+# only, no `box`. Docs ask for a string or `{"messages": [...]}` state; other
+# JSON is taken but read in another form, so `string_state` sends it as JSON
+# text indented by 2, the form the models were trained on (typed ingress
+# only; raw passthrough keeps the bytes). With no long-context opt-in,
+# `question_context_tokens` is a hard limit per question.
+[providers.baseten]
+base_url = "https://inference.baseten.co"
+api = "systemone"
+auth = "baseten"
+
+[[providers.baseten.models]]
+id = "mammoth-1"
+upstream = "decision-models/baseten-mammoth-27b-latest"
+question_context_tokens = 32768
+max_options = 255
+max_levels = 10
+images = "none"
+compat = { noul_confidence = false, box = false, string_state = true }
+
+[[providers.baseten.models]]
+id = "elephant-1"
+upstream = "decision-models/baseten-elephant-9b-latest"
+question_context_tokens = 32768
+max_options = 255
+max_levels = 10
+images = "none"
+compat = { noul_confidence = false, box = false, string_state = true }
+
 [aliases.decide]
 models = ["workers-ai/clef-flash", "typesafe/jev-latest"]
 spill = false
@@ -116,6 +151,13 @@ adaptive = true
 rpm = 300
 tpm = 2_000_000
 max_in_flight = 16
+adaptive = true
+
+# Baseten Model APIs publish no decision-model limits.
+[limits.baseten]
+rpm = 600
+tpm = 2_000_000
+max_in_flight = 32
 adaptive = true
 
 # gpt-6-luna "Build" tier defaults (Decisions-specific limits unknown).

@@ -8,6 +8,13 @@
 //! - A missing key returns 403, not 401. On the typed `/v1/systemone`
 //!   ingress s1 turns that 403 into 401 with a message that names
 //!   `s1 auth set` ([`map_missing_key`]). `/v1/raw` returns the 403 unchanged.
+//!
+//! Baseten Model APIs (the baselabs decision models) speak the same format
+//! with a bearer key, so they use this client too. Baseten docs ask for a
+//! string or a `{"messages": [...]}` state; with `compat.string_state` s1
+//! sends any other JSON state as text ([`stringify_state`], on the typed
+//! ingress only). A bad key
+//! returns 403 `{"error": ...}`, passed through unchanged.
 
 use async_trait::async_trait;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
@@ -86,6 +93,58 @@ pub fn opt_in_headers(model: Option<&Model>, info: &RouteInfo, sent: &HeaderMap)
     out
 }
 
+/// For a model with `compat.string_state` (Baseten): a `state` that is not
+/// a string or a `{"messages": [...]}` conversation is sent as JSON text,
+/// indented by 2: the form the baselabs models were trained on. Baseten
+/// takes other JSON too but reads it in another form (live, 2026-10-22: the
+/// answers differ). The typed ingress calls this; `/v1/raw` sends the
+/// client's bytes unchanged.
+///
+/// Every other top-level member keeps its exact bytes. Inside the state,
+/// key order and strings are kept; numbers are printed again (`1e2` becomes
+/// `100.0`, an integer beyond 64 bits loses precision). `Ok(None)`: the body
+/// needs no change. `Err`: the state is nested deeper than s1 can read.
+pub fn stringify_state(body: &[u8]) -> Result<Option<Bytes>, String> {
+    use crate::protocol::TopLevel;
+    let Ok(members) = serde_json::from_slice::<TopLevel<'_>>(body) else {
+        return Ok(None);
+    };
+    let Some((_, raw)) = members.0.iter().find(|(k, _)| k == "state") else {
+        return Ok(None);
+    };
+    let state: serde_json::Value = match serde_json::from_str(raw.get()) {
+        Ok(v) => v,
+        Err(e) if e.to_string().contains("recursion limit") => {
+            return Err("`state` is nested too deeply to send as text (at most 127 levels)".into());
+        }
+        Err(_) => return Ok(None),
+    };
+    let conversation = state
+        .as_object()
+        .is_some_and(|o| o.len() == 1 && o.get("messages").is_some_and(|m| m.is_array()));
+    if state.is_string() || state.is_null() || conversation {
+        return Ok(None);
+    }
+    let text = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
+    let text = serde_json::to_string(&text).map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(body.len() + text.len());
+    out.push(b'{');
+    for (i, (k, v)) in members.0.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(serde_json::to_string(k).expect("key").as_bytes());
+        out.push(b':');
+        if k == "state" {
+            out.extend_from_slice(text.as_bytes());
+        } else {
+            out.extend_from_slice(v.get().as_bytes());
+        }
+    }
+    out.push(b'}');
+    Ok(Some(Bytes::from(out)))
+}
+
 /// TypeSafe answers 403 (not 401) when no key arrives. Make it a clear 401.
 pub fn map_missing_key(resp: ProviderResponse, auth_entry: &str) -> ProviderResponse {
     if resp.status != StatusCode::FORBIDDEN {
@@ -143,12 +202,12 @@ impl Backend for TypeSafe {
         let key = self.ctx.credential(&req, &self.name, auth_entry)?;
         let mut headers = HeaderMap::new();
         copy_headers(&req.headers, &mut headers, forward_request_header);
+        let model = self
+            .provider
+            .models
+            .iter()
+            .find(|m| m.upstream_id() == req.upstream_model);
         if let Ok(info) = Systemone.inspect(&req.body) {
-            let model = self
-                .provider
-                .models
-                .iter()
-                .find(|m| m.upstream_id() == req.upstream_model);
             headers.extend(opt_in_headers(model, &info, &headers));
         }
         if !headers.contains_key(header::CONTENT_TYPE) {
@@ -210,6 +269,58 @@ mod tests {
             .unwrap()
             .model
             .clone()
+    }
+
+    fn state_of(body: &[u8]) -> serde_json::Value {
+        serde_json::from_slice::<serde_json::Value>(body).unwrap()["state"].clone()
+    }
+
+    fn stringified(body: &[u8]) -> Bytes {
+        stringify_state(body).unwrap().expect("state converted")
+    }
+
+    #[test]
+    fn stringify_state_sends_json_states_as_indented_text() {
+        let body =
+            r#"{"model":"m","state":{"b":1,"a":"é"},"questions":{"q2":{},"q1":{}}}"#.as_bytes();
+        let out = stringified(body);
+        assert_eq!(state_of(&out), "{\n  \"b\": 1,\n  \"a\": \"é\"\n}");
+        // Other members keep their exact bytes (and so question and option
+        // order).
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{"model":"m","state":"{\n  \"b\": 1,\n  \"a\": \"é\"\n}","questions":{"q2":{},"q1":{}}}"#
+        );
+        let spaced = br#"{ "questions" : {"q": {"options": [ "b" , "a" ]}}, "state": [1,2] }"#;
+        let out = stringified(spaced);
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{"questions":{"q": {"options": [ "b" , "a" ]}},"state":"[\n  1,\n  2\n]"}"#
+        );
+        assert_eq!(state_of(&stringified(br#"{"state":7}"#)), "7");
+    }
+
+    #[test]
+    fn stringify_state_keeps_text_and_conversations() {
+        let none = |b: &[u8]| stringify_state(b).unwrap().is_none();
+        assert!(none(br#"{"state":"text"}"#));
+        assert!(none(br#"{"state":null}"#));
+        assert!(none(br#"{"questions":{}}"#));
+        assert!(none(
+            br#"{"state":{"messages":[{"role":"user","content":"hi"}]}}"#
+        ));
+        // Not a bare conversation: one more key, or `messages` not a list.
+        assert!(!none(br#"{"state":{"messages":[],"x":1}}"#));
+        assert!(!none(br#"{"state":{"messages":"hi"}}"#));
+        assert!(none(b"not json"));
+    }
+
+    #[test]
+    fn stringify_state_refuses_a_state_too_deep_to_read() {
+        let deep = format!(r#"{{"state":{}1{}}}"#, "[".repeat(200), "]".repeat(200));
+        assert!(stringify_state(deep.as_bytes()).is_err());
+        let ok = format!(r#"{{"state":{}1{}}}"#, "[".repeat(100), "]".repeat(100));
+        assert!(stringify_state(ok.as_bytes()).unwrap().is_some());
     }
 
     #[test]

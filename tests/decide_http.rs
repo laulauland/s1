@@ -913,3 +913,134 @@ async fn raw_routing_reads_only_the_top_level_model() {
     assert_eq!(r.headers["s1-model"], "workers-ai/clef");
     h.server.shutdown().await;
 }
+
+/// All keys plus a `baseten` key (the mocks point `baseten` at the TypeSafe mock).
+async fn baseten_harness() -> Harness {
+    let h = harness().await;
+    KeyResolver::new(h.paths.auth_file(), |_| None)
+        .update(|f| f.set_api_key("baseten", &Secret::new(TEST_KEY), None))
+        .unwrap();
+    h
+}
+
+#[tokio::test]
+async fn baseten_gets_its_slug_and_json_state_as_text() {
+    let h = baseten_harness().await;
+    let body = serde_json::to_vec(&json!({
+        "model": "baseten/mammoth-1",
+        "state": {"ticket": "charged twice", "note": "yes"},
+        "questions": {
+            "billing": {"type": "noul", "instructions": "Is this about billing?"},
+            "tone": {"type": "choice", "instructions": "Tone?", "criteria": {"calm": "Neutral", "angry": "Upset"}}
+        }
+    }))
+    .unwrap();
+    let r = h.post(&body).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.headers["s1-backend"], "baseten");
+    assert_eq!(r.headers["s1-model"], "baseten/mammoth-1");
+    let seen = h.mocks.jev.last();
+    assert_eq!(seen.headers["authorization"], format!("Bearer {TEST_KEY}"));
+    let sent: Value = serde_json::from_slice(&seen.body).unwrap();
+    assert_eq!(sent["model"], "decision-models/baseten-mammoth-27b-latest");
+    assert_eq!(
+        sent["state"],
+        "{\n  \"ticket\": \"charged twice\",\n  \"note\": \"yes\"\n}"
+    );
+    let options: Vec<_> = sent["questions"]["tone"]["criteria"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect();
+    assert_eq!(options, ["calm", "angry"], "option order is kept");
+    assert_eq!(json_of(&r)["answers"]["billing"]["noul"], 0.9);
+    h.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn baseten_keeps_text_and_conversation_states_unchanged() {
+    let h = baseten_harness().await;
+    let r = h.post(&req("elephant-1")).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.headers["s1-model"], "baseten/elephant-1");
+    let sent: Value = serde_json::from_slice(&h.mocks.jev.last().body).unwrap();
+    assert_eq!(sent["model"], "decision-models/baseten-elephant-9b-latest");
+    assert_eq!(sent["state"], "I was charged twice. yes");
+
+    let conversation = json!({"messages": [{"role": "user", "content": "refund please"}]});
+    let body = serde_json::to_vec(&json!({
+        "model": "baseten/elephant-1",
+        "state": conversation,
+        "questions": {"refund": {"type": "noul", "instructions": "Asks for a refund?"}}
+    }))
+    .unwrap();
+    let r = h.post(&body).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let sent: Value = serde_json::from_slice(&h.mocks.jev.last().body).unwrap();
+    assert_eq!(sent["state"], conversation);
+    h.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn baseten_refuses_what_the_models_cannot_take() {
+    let h = baseten_harness().await;
+    let boxq = json!({
+        "model": "baseten/mammoth-1",
+        "state": "x",
+        "questions": {"q": {"type": "box", "instructions": "Where?"}}
+    });
+    let levels: Vec<String> = (0..11).map(|i| i.to_string()).collect();
+    let eleven_levels = json!({
+        "model": "baseten/mammoth-1",
+        "state": "x",
+        "questions": {"q": {"type": "score", "instructions": "How much?", "criteria": levels}}
+    });
+    let image = json!({
+        "model": "baseten/elephant-1",
+        "state": "x <image:a>",
+        "assets": {"a": {"type": "image", "data_base64": "aGk=", "format": "png"}},
+        "questions": {"q": {"type": "noul", "instructions": "A cat?"}}
+    });
+    for body in [boxq, eleven_levels, image] {
+        let r = h.post(&serde_json::to_vec(&body).unwrap()).await;
+        assert_eq!(
+            r.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            String::from_utf8_lossy(&r.body)
+        );
+    }
+    assert!(h.mocks.jev.all().is_empty(), "nothing reached the provider");
+    h.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn baseten_raw_passthrough_keeps_the_exact_bytes() {
+    let h = baseten_harness().await;
+    // A JSON state goes as is: `string_state` is for the typed ingress only.
+    let body = br#"{"model": "decision-models/baseten-mammoth-27b-latest", "state": {"b": 1.0, "a": 2}, "questions": {"q": {"type": "noul", "instructions": "Yes?"}}}"#;
+    let r = h.post_to("/v1/raw/systemone?provider=baseten", body).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(h.mocks.jev.last().body.as_ref(), body.as_slice());
+    h.server.shutdown().await;
+}

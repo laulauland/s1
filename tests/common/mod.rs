@@ -660,8 +660,8 @@ impl Mocks {
     /// Overlay pointing every provider at the mocks.
     pub fn overlay(&self) -> String {
         format!(
-            "[providers.typesafe]\nbase_url = \"http://{}\"\n[providers.workers-ai]\nbase_url = \"http://{}\"\n[providers.openai]\nbase_url = \"http://{}/v1\"\n",
-            self.typesafe, self.workers_ai, self.openai
+            "[providers.typesafe]\nbase_url = \"http://{}\"\n[providers.workers-ai]\nbase_url = \"http://{}\"\n[providers.openai]\nbase_url = \"http://{}/v1\"\n[providers.baseten]\nbase_url = \"http://{}\"\n",
+            self.typesafe, self.workers_ai, self.openai, self.typesafe
         )
     }
 }

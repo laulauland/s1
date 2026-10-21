@@ -213,6 +213,7 @@ trait Translate {
 | Workers AI Clef | systemone | Model in the URL path and in the body (must match); Workers AI envelope around the response; docs say long input is silently truncated, but live calls get an explicit error (mapped to `too_long`); no `assets` (takes an `images` array); 1 to 64 questions, at least 2 options and 2 levels; every question needs non-blank `instructions`; question names `[A-Za-z0-9_.-]`, 1 to 100 characters (alias routing skips Clef when these do not fit) |
 | Workers AI Clairic | clairic | Same URL and envelope as Clef; preview format; long state cut and flagged `truncated` (not refused) up to `bytes / 4` = 2 × context; errors keep the envelope |
 | OpenAI Decisions | openai-decisions | Public beta; refusals per question |
+| Baseten (baselabs `mammoth-1`, `elephant-1`) | systemone | Same client as Jev, bearer key `BASETEN_API_KEY` (`Api-Key` also works); upstream ids are Model API slugs (`decision-models/baseten-mammoth-27b-latest`, `decision-models/baseten-elephant-9b-latest`); text only, no `box`, at most 10 levels and 255 options; `instructions` optional. Live (2026-10-22): one prompt (state plus one question) takes at most 32768 tokens, the whole request has no token limit of its own; Baseten refuses (422) a state over 50000 characters and over 512 options per request (a noul counts 2), and s1 leaves those checks to it. Docs ask for a string or `{"messages": [...]}` state; other JSON is taken but read in another form, so on the typed ingress s1 sends it as JSON text indented by 2, the trained form (`compat.string_state`; key order kept, numbers printed again, other members byte for byte; a state nested too deep to read is refused with 422; raw passthrough sends the bytes unchanged). s1 also refuses a question whose prompt is surely over 32768 tokens (`question_context_tokens` with no long-context opt-in). The cache key is canonical JSON, so two states that differ only in key order share an entry. Errors are `{"error", "error_type"}`; a bad key is 403, passed through |
 
 **Translation rules: OpenAI Decisions and systemone**
 
@@ -492,6 +493,9 @@ Each milestone ends with something usable from the shell.
 
 - [TypeSafe System One API reference](https://docs.typesafe.ai/api/system-one.md)
 - [OpenAI Decisions API reference](https://developers.openai.com/api/reference/typescript/resources/decisions/index.md)
+- [Baseten System One reference](https://docs.baseten.co/reference/inference-api/system-one)
+- [Baseten decision models](https://docs.baseten.co/inference/model-apis/decision-models)
+- [baselabs models](https://huggingface.co/baselabs)
 - [Cloudflare Clairic model page](https://developers.cloudflare.com/workers-ai/models/clairic/)
 - [Cloudflare Clairic changelog](https://developers.cloudflare.com/changelog/post/2026-10-19-clairic-workers-ai/)
 - [TSFM.ai](https://github.com/tsfm-ai)

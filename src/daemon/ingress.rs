@@ -287,6 +287,25 @@ pub async fn handle(
             Ok(b) => b,
             Err(e) => return error_response(proto, &S1Error::InvalidRequest(e.0), &rid, None),
         };
+    // Baseten: a JSON state goes as text (typed ingress only; raw is raw).
+    let send_body = if route.model.compat_flag("string_state", false) {
+        match crate::backend::typesafe::stringify_state(&send_body) {
+            Ok(b) => b.unwrap_or(send_body),
+            Err(m) => {
+                return with_model(
+                    error_response(
+                        proto,
+                        &S1Error::InvalidRequest(m),
+                        &rid,
+                        Some(&route.provider),
+                    ),
+                    &route.model_id,
+                );
+            }
+        }
+    } else {
+        send_body
+    };
     let (guard, credential) = st.guard_with_key(&route.provider).unzip();
     let req = BackendRequest {
         upstream_model: route.upstream.clone(),
