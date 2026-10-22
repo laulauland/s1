@@ -1,0 +1,8 @@
+# Started by s1-upgrade.path. try-restart does nothing if s1 is not running;
+# s1.socket keeps the listeners open during the restart.
+[Unit]
+Description=Restart s1 after an upgrade
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user try-restart s1.service

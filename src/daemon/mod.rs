@@ -24,6 +24,7 @@ use crate::protect::Protection;
 use crate::queue::{Bounds, Scheduler};
 use crate::secrets::{ApiKey, KeyResolver, Secret};
 
+pub mod activation;
 mod auth;
 mod cache;
 mod decode;
@@ -31,6 +32,7 @@ pub(crate) mod ingress;
 pub(crate) mod models;
 pub(crate) mod raw;
 mod routes;
+mod serve;
 mod status;
 
 pub use raw::MAX_BODY;
@@ -250,43 +252,81 @@ async fn serve_inner(
         lifecycle.info_file = Some(file);
     }
     let unix = lifecycle.publish(&opts.socket)?;
+    Ok(start(unix, tcp, opts, tcp_addr, lifecycle))
+}
 
-    let app: Router = router(opts.state);
+/// Serve the listeners systemd passed ([`activation`]). systemd owns the
+/// socket file: this daemon neither binds, replaces, nor removes it.
+pub async fn serve_inherited(
+    listeners: activation::Inherited,
+    state: AppState,
+    token: Secret,
+    info_file: Option<&Path>,
+) -> Result<RunningServer, DaemonError> {
+    let fail = |e: std::io::Error| DaemonError::Io(format!("inherited listener: {e}"));
+    let socket = listeners
+        .unix
+        .local_addr()
+        .ok()
+        .and_then(|a| a.as_pathname().map(Path::to_path_buf))
+        .ok_or_else(|| DaemonError::Io("inherited Unix listener has no path".into()))?;
+    listeners.unix.set_nonblocking(true).map_err(fail)?;
+    listeners.tcp.set_nonblocking(true).map_err(fail)?;
+    let unix = UnixListener::from_std(listeners.unix).map_err(fail)?;
+    let tcp = TcpListener::from_std(listeners.tcp).map_err(fail)?;
+    let tcp_addr = tcp.local_addr().map_err(fail)?;
+    let mut lifecycle = Lifecycle::inherited();
+    if let Some(file) = info_file {
+        let info = DaemonInfo {
+            pid: std::process::id(),
+            socket: socket.clone(),
+            tcp: tcp_addr,
+        };
+        write_info(file, &info)?;
+        lifecycle.info_file = Some(file.to_path_buf());
+    }
+    let opts = ServerOptions {
+        socket,
+        tcp: tcp_addr,
+        state,
+        token,
+    };
+    Ok(start(unix, tcp, opts, tcp_addr, lifecycle))
+}
+
+/// Serve the shared router on both listeners until `shutdown`.
+fn start(
+    unix: UnixListener,
+    tcp: TcpListener,
+    opts: ServerOptions,
+    tcp_addr: SocketAddr,
+    lifecycle: Lifecycle,
+) -> RunningServer {
+    // `/health` tells `s1 util daemon stop` that systemd owns the listeners.
+    let activated = routes::SocketActivated(lifecycle._lock.is_none());
+    let app: Router = router(opts.state).layer(Extension(activated));
     let tcp_app = auth::require_bearer(app.clone(), opts.token);
     // Only the socket may name local image files (see `crate::images`).
     let app = app.layer(Extension(Origin::UnixSocket));
     let (stop, rx) = watch::channel(false);
 
-    let mut rx1 = rx.clone();
-    let unix_task = tokio::spawn(async move {
-        axum::serve(unix, app)
-            .with_graceful_shutdown(async move {
-                let _ = rx1.wait_for(|s| *s).await;
-            })
-            .await
-    });
-    let mut rx2 = rx;
-    let tcp_task = tokio::spawn(async move {
-        axum::serve(tcp, tcp_app)
-            .with_graceful_shutdown(async move {
-                let _ = rx2.wait_for(|s| *s).await;
-            })
-            .await
-    });
-    Ok(RunningServer {
+    let unix_task = tokio::spawn(serve::serve_until(unix, app, rx.clone()));
+    let tcp_task = tokio::spawn(serve::serve_until(tcp, tcp_app, rx));
+    RunningServer {
         socket: opts.socket,
         tcp: tcp_addr,
         stop,
         tasks: vec![unix_task, tcp_task],
         lifecycle,
-    })
+    }
 }
 
 /// One daemon's claim on a socket path: an exclusive `flock` on
 /// `<socket>.lock`, held from the stale-socket probe until shutdown, and the
-/// identity of the socket inode this daemon made.
+/// identity of the socket inode this daemon made. With inherited listeners
+/// there is no lock and no socket of its own.
 struct Lifecycle {
-    _lock: std::fs::File,
+    _lock: Option<std::fs::File>,
     /// (device, inode) of the socket this daemon bound.
     socket_id: Option<(u64, u64)>,
     /// `daemon.json` written by this daemon.
@@ -340,10 +380,20 @@ impl Lifecycle {
             std::fs::remove_file(path).map_err(io("cannot remove stale", path))?;
         }
         Ok(Self {
-            _lock: lock,
+            _lock: Some(lock),
             socket_id: None,
             info_file: None,
         })
+    }
+
+    /// For listeners systemd owns: nothing to lock or remove but
+    /// `daemon.json`.
+    fn inherited() -> Self {
+        Self {
+            _lock: None,
+            socket_id: None,
+            info_file: None,
+        }
     }
 
     /// Bind the socket in a fresh 0700 directory next to `path`, make it
@@ -405,8 +455,13 @@ fn write_info(file: &Path, info: &DaemonInfo) -> Result<(), DaemonError> {
     .map_err(io("cannot write", file))
 }
 
-/// Run the daemon in the foreground until SIGTERM or SIGINT.
-pub async fn run(paths: Paths) -> Result<(), DaemonError> {
+/// Run the daemon in the foreground until SIGTERM or SIGINT. With
+/// `inherited` listeners (systemd socket activation) it serves those instead
+/// of binding its own; the config's `listen.tcp` is then not used.
+pub async fn run(
+    paths: Paths,
+    inherited: Option<activation::Inherited>,
+) -> Result<(), DaemonError> {
     let config =
         Config::load(&paths.config_file()).map_err(|e| DaemonError::Setup(e.to_string()))?;
     let tcp = config.tcp_addr().map_err(DaemonError::Setup)?;
@@ -424,39 +479,76 @@ pub async fn run(paths: Paths) -> Result<(), DaemonError> {
         Catalog::load(&paths.models_file()).map_err(|e| DaemonError::Setup(e.to_string()))?;
     let models = catalog.models().count();
     let state = AppState::from_config(catalog, keys, &config, &paths)?;
-    let server = serve_with_info(
-        ServerOptions {
-            socket: paths.socket.clone(),
-            tcp,
-            state,
-            token,
-        },
-        &paths.daemon_file(),
-    )
-    .await?;
+    let activated = inherited.is_some();
+    let mut signals = Signals::install()?;
+    let server = match inherited {
+        Some(listeners) => {
+            serve_inherited(listeners, state, token, Some(&paths.daemon_file())).await?
+        }
+        None => {
+            serve_with_info(
+                ServerOptions {
+                    socket: paths.socket.clone(),
+                    tcp,
+                    state,
+                    token,
+                },
+                &paths.daemon_file(),
+            )
+            .await?
+        }
+    };
 
     tracing::info!(
         event = "daemon_start",
         pid = std::process::id(),
         socket = %server.socket.display(),
         tcp = %server.tcp,
+        socket_activated = activated,
         models,
         "s1 daemon started"
     );
+    if activated && server.socket != paths.socket {
+        tracing::warn!(
+            event = "socket_mismatch",
+            inherited = %server.socket.display(),
+            expected = %paths.socket.display(),
+            "systemd passed a socket at another path than the CLI uses"
+        );
+    }
 
-    wait_for_signal().await;
+    signals.wait_for_stop().await;
     tracing::info!(event = "daemon_stop", "s1 daemon stopping");
+    // Open requests finish first; with socket activation, new connections
+    // wait in systemd's listen backlog for the next daemon.
     server.shutdown().await;
+    tracing::info!(event = "daemon_stopped", "s1 daemon stopped");
     Ok(())
 }
 
-async fn wait_for_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
+/// SIGTERM and SIGINT, installed before the listeners serve: a signal that
+/// comes right after start still drains instead of killing the process.
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn install() -> Result<Self, DaemonError> {
+        use tokio::signal::unix::{SignalKind, signal};
+        let fail =
+            |e: std::io::Error| DaemonError::Setup(format!("cannot install signal handler: {e}"));
+        Ok(Self {
+            term: signal(SignalKind::terminate()).map_err(fail)?,
+            int: signal(SignalKind::interrupt()).map_err(fail)?,
+        })
+    }
+
+    async fn wait_for_stop(&mut self) {
+        tokio::select! {
+            _ = self.term.recv() => {}
+            _ = self.int.recv() => {}
+        }
     }
 }
 

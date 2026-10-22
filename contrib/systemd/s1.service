@@ -1,0 +1,20 @@
+# The s1 daemon, started by s1.socket on the first connection (or at login
+# with `systemctl --user enable s1.socket`).
+[Unit]
+Description=s1 gateway daemon
+Requires=s1.socket
+After=s1.socket
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/s1 util daemon run
+Restart=on-failure
+RestartSec=2
+# SIGTERM: stop accepting, finish open requests, exit. Long batches get
+# this long before systemd kills them.
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+Also=s1.socket

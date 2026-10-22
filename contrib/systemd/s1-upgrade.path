@@ -1,0 +1,10 @@
+# Restart s1 when its binary changes (`cargo install --path .`).
+[Unit]
+Description=Restart s1 when its binary changes
+
+[Path]
+PathChanged=%h/.cargo/bin/s1
+Unit=s1-upgrade.service
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,18 @@
+# Listeners for the s1 daemon. systemd holds them, so they stay open while
+# s1.service restarts: a client that connects then waits in the backlog for
+# the new daemon instead of getting "connection refused".
+# Install: see "Daemon" in README.md.
+[Unit]
+Description=s1 gateway listeners
+
+[Socket]
+# Must match the path the CLI uses ($XDG_RUNTIME_DIR/s1.sock, or S1_SOCKET).
+ListenStream=%t/s1.sock
+SocketMode=0600
+DirectoryMode=0700
+# Must be a loopback address (`listen.tcp` in config.toml is not used).
+ListenStream=127.0.0.1:7341
+Service=s1.service
+
+[Install]
+WantedBy=sockets.target

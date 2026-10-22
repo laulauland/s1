@@ -44,6 +44,7 @@ The forecast ingress exists in v1 so that the format is reserved, but it has no 
 - **TCP on 127.0.0.1** for MCP clients and HTTP SDKs, because most MCP clients accept only `http://` URLs. Requests need the local bearer token from the auth file.
 - One `axum` router serves both listeners.
 - The CLI starts the daemon on first use if it is not running (`s1 util daemon start` also exists).
+- As built: systemd socket activation (`contrib/systemd/`). With `LISTEN_PID` equal to its pid, the daemon serves the passed fds (one Unix, one loopback TCP listener, told apart by family) and never binds, replaces, or removes the socket file. SIGTERM drains open requests, and a connection accepted before it may send its first request within 5 s (hyper alone closes such a connection as idle); an idle kept-alive connection is closed. Connections made during a restart wait in the backlog that systemd keeps. `/health` reports `socket_activated`, and `s1 util daemon stop` then refuses and names `systemctl --user stop s1.socket s1.service`. `s1-upgrade.path` restarts the service when `~/.cargo/bin/s1` changes.
 
 **Large inputs**
 

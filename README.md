@@ -111,6 +111,28 @@ s1 models              # models, aliases, availability
 s1 util daemon logs
 ```
 
+On Linux, let systemd run it instead. systemd then holds the socket and the TCP
+port, so a restart refuses no connection, and a new `cargo install` restarts the
+daemon by itself. Stop a daemon that runs now first (it holds the socket and the
+port; an older `s1.service` without `s1.socket` must stop too):
+
+```sh
+s1 util daemon stop
+systemctl --user stop s1.service 2>/dev/null
+mkdir -p ~/.config/systemd/user
+cp contrib/systemd/* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now s1.socket s1-upgrade.path
+```
+
+On SIGTERM the daemon stops accepting, finishes open requests (up to 120 s), and
+exits; new connections wait for the next daemon. A connection that is open but
+has not sent its request yet gets 5 s to send it. An idle kept-alive connection
+is closed; the client opens a new one, as HTTP keep-alive requires. With
+`s1.socket` the TCP address comes from the unit (`ListenStream=127.0.0.1:7341`),
+not from `config.toml`, and `s1 util daemon stop` refuses: use
+`systemctl --user stop s1.socket s1.service`.
+
 ### Add it to your agent (MCP)
 
 TCP clients need the local bearer token:

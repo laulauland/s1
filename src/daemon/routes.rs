@@ -18,6 +18,17 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({"ok": true, "pid": std::process::id()}))
+/// Whether systemd passed the listeners (see [`super::activation`]).
+#[derive(Clone, Copy)]
+pub struct SocketActivated(pub bool);
+
+async fn health(
+    activated: Option<axum::Extension<SocketActivated>>,
+) -> axum::Json<serde_json::Value> {
+    let activated = activated.is_some_and(|a| a.0.0);
+    axum::Json(serde_json::json!({
+        "ok": true,
+        "pid": std::process::id(),
+        "socket_activated": activated,
+    }))
 }
