@@ -37,7 +37,7 @@ pub const H_CAPACITY: &str = "s1-capacity";
 /// Attempts after the first.
 pub const H_RETRIES: &str = "s1-retries";
 
-pub fn routes() -> Router<AppState> {
+pub fn routes() -> Router<crate::daemon::reload::Shared> {
     Router::new().route("/v1/raw/{protocol}", post(raw))
 }
 

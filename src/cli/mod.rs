@@ -115,6 +115,7 @@ mod tests {
         for args in [
             &["s1", "util", "daemon", "start"][..],
             &["s1", "util", "daemon", "stop"],
+            &["s1", "util", "daemon", "reload"],
             &["s1", "util", "daemon", "logs", "-n", "5"],
             &["s1", "util", "raw", "systemone"],
             &[

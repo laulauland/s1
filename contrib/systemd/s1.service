@@ -13,6 +13,9 @@ RestartSec=2
 # SIGTERM: stop accepting, finish open requests, exit. Long batches get
 # this long before systemd kills them.
 TimeoutStopSec=120
+# `systemctl --user reload s1`: load models.toml again (it also reloads by
+# itself when the file changes).
+ExecReload=/bin/kill -HUP $MAINPID
 UMask=0077
 NoNewPrivileges=yes
 

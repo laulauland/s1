@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use super::AppState;
 
-pub fn routes() -> Router<AppState> {
+pub fn routes() -> Router<crate::daemon::reload::Shared> {
     Router::new().route("/cache/clear", post(clear))
 }
 

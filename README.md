@@ -300,6 +300,8 @@ Useful headers: `Cache-Control: no-cache` (refresh) or `no-store` (skip the cach
 1. Add the provider and model to `~/.config/s1/models.toml` (same shape as
    `src/catalog/builtin.toml`; any field there can be overridden), and its key with
    `s1 auth set <provider>`.
+   The daemon loads the file again when it changes (`s1 util daemon reload` does
+   it at once and prints any error; a bad file keeps the old catalog).
 2. Run your existing templates against it with `-m provider/model`.
 3. Compare against the model you use today on the same file:
 

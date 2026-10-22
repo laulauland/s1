@@ -23,52 +23,96 @@ pub fn key_id(key: &str) -> String {
     format!("k_{}", &h.to_hex()[..8])
 }
 
+/// The schedulers of one provider, one per key.
+type KeyGuards = Mutex<BTreeMap<String, Arc<Scheduler>>>;
+
 /// All schedulers, created on first use.
 pub struct Protection {
     limits: BTreeMap<String, Limits>,
     bounds: Bounds,
-    guards: Mutex<BTreeMap<(String, String), Arc<Scheduler>>>,
+    /// Per provider. A reload shares the map of a provider whose limits did
+    /// not change, so a scheduler made later through either snapshot is the
+    /// same one.
+    guards: Mutex<BTreeMap<String, Arc<KeyGuards>>>,
 }
 
 impl Protection {
     /// Limits per provider from the catalog's `[limits.*]` tables (already
     /// validated when the catalog loaded); defaults for the rest.
     pub fn new(catalog: &Catalog, bounds: Bounds) -> Self {
-        let limits = catalog
+        let limits: BTreeMap<String, Limits> = catalog
             .providers
             .keys()
             .map(|p| (p.clone(), catalog.limits_for(p).unwrap_or_default()))
             .collect();
+        let guards = limits.keys().map(|p| (p.clone(), Arc::default())).collect();
         Self {
             limits,
             bounds,
-            guards: Mutex::new(BTreeMap::new()),
+            guards: Mutex::new(guards),
         }
+    }
+
+    /// Protection for a reloaded catalog: the schedulers (queue, AIMD rate,
+    /// breaker) of providers whose limits did not change carry over, also
+    /// ones made after the reload through the old snapshot; the rest start
+    /// fresh on first use. Requests already queued on a dropped scheduler
+    /// finish there.
+    pub fn reloaded(&self, catalog: &Catalog) -> Self {
+        let next = Self::new(catalog, self.bounds);
+        {
+            let old = self.guards.lock().unwrap_or_else(|e| e.into_inner());
+            let mut new = next.guards.lock().unwrap_or_else(|e| e.into_inner());
+            for (provider, keys) in old.iter() {
+                if self.limits.contains_key(provider)
+                    && self.limits.get(provider) == next.limits.get(provider)
+                {
+                    new.insert(provider.clone(), keys.clone());
+                }
+            }
+        }
+        next
     }
 
     pub fn limits(&self, provider: &str) -> Limits {
         self.limits.get(provider).cloned().unwrap_or_default()
     }
 
+    fn keys(&self, provider: &str) -> Arc<KeyGuards> {
+        let mut g = self.guards.lock().unwrap_or_else(|e| e.into_inner());
+        g.entry(provider.to_string()).or_default().clone()
+    }
+
     /// The scheduler for a provider and key, created on first use.
     pub fn guard(&self, provider: &str, key: &str) -> Arc<Scheduler> {
         let id = key_id(key);
-        let mut g = self.guards.lock().unwrap_or_else(|e| e.into_inner());
-        g.entry((provider.to_string(), id.clone()))
+        let keys = self.keys(provider);
+        let mut g = keys.lock().unwrap_or_else(|e| e.into_inner());
+        g.entry(id.clone())
             .or_insert_with(|| Scheduler::new(provider, &id, self.limits(provider), self.bounds))
             .clone()
     }
 
     /// The scheduler for a provider and key, if it exists.
     pub fn existing(&self, provider: &str, key: &str) -> Option<Arc<Scheduler>> {
-        let g = self.guards.lock().unwrap_or_else(|e| e.into_inner());
-        g.get(&(provider.to_string(), key_id(key))).cloned()
+        let keys = self.keys(provider);
+        let g = keys.lock().unwrap_or_else(|e| e.into_inner());
+        g.get(&key_id(key)).cloned()
     }
 
     /// Every scheduler made so far.
     pub fn all(&self) -> Vec<Arc<Scheduler>> {
-        let g = self.guards.lock().unwrap_or_else(|e| e.into_inner());
-        g.values().cloned().collect()
+        let providers: Vec<Arc<KeyGuards>> = {
+            let g = self.guards.lock().unwrap_or_else(|e| e.into_inner());
+            g.values().cloned().collect()
+        };
+        providers
+            .iter()
+            .flat_map(|keys| {
+                let g = keys.lock().unwrap_or_else(|e| e.into_inner());
+                g.values().cloned().collect::<Vec<_>>()
+            })
+            .collect()
     }
 }
 
@@ -354,5 +398,39 @@ mod tests {
         assert!(id.starts_with("k_") && id.len() == 10);
         assert!(!id.contains("secret"));
         assert_eq!(id, key_id("sk-secret-value"));
+    }
+
+    #[test]
+    fn reload_keeps_schedulers_of_providers_with_the_same_limits() {
+        let p = Protection::new(&Catalog::builtin(), Bounds::default());
+        let ts = p.guard("typesafe", "k1");
+        let wa = p.guard("workers-ai", "k1");
+        let cat = Catalog::with_overlay_str(
+            "[limits.workers-ai]\nrpm = 7\n[providers.typesafe]\nbase_url = \"http://x\"",
+        )
+        .unwrap();
+        let next = p.reloaded(&cat);
+        // Same limits (a base_url change does not matter): same scheduler.
+        assert!(Arc::ptr_eq(&next.existing("typesafe", "k1").unwrap(), &ts));
+        // New limits: a fresh scheduler with them.
+        assert!(next.existing("workers-ai", "k1").is_none());
+        let fresh = next.guard("workers-ai", "k1");
+        assert!(!Arc::ptr_eq(&fresh, &wa));
+        assert_eq!(fresh.limits().rpm, Some(7));
+        // A provider that is gone keeps nothing.
+        let mut gone = Catalog::builtin();
+        gone.providers.remove("typesafe");
+        assert!(next.reloaded(&gone).existing("typesafe", "k1").is_none());
+    }
+
+    #[test]
+    fn a_scheduler_made_after_the_reload_through_the_old_snapshot_is_shared() {
+        // A request holds the old snapshot (say, while its images download)
+        // and makes the first scheduler for its key after the reload.
+        let old = Protection::new(&Catalog::builtin(), Bounds::default());
+        let new = old.reloaded(&Catalog::builtin());
+        let late = old.guard("typesafe", "k2");
+        assert!(Arc::ptr_eq(&new.guard("typesafe", "k2"), &late));
+        assert_eq!(new.all().len(), 1);
     }
 }

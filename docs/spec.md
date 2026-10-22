@@ -124,6 +124,8 @@ The catalog follows the pattern of pi and opencode: a small compiled-in catalog 
 2. User overlay: `~/.config/s1/models.toml`. It can add providers and models, or override any field.
 3. Compiled-in catalog for the four v1 backends.
 
+As built, the daemon reloads the overlay with no restart: when the file changes (polled every 0.5 s; a change is read once two polls agree, and a deleted file gives the compiled-in catalog; `watch_models = false` in `config.toml` turns the polling off), on SIGHUP (`systemctl --user reload s1`), and on `POST /reload`, Unix socket only (`s1 util daemon reload`). A file that does not load leaves the old catalog in use; the error goes to the log, the `/reload` answer (422 `invalid_catalog`), and `catalog.last_error` in `/status`. Catalog, backends, and protection form one snapshot; a request uses the snapshot current when it starts. Schedulers (queue, AIMD rate, breaker) carry over for providers whose `[limits]` did not change; the others start fresh, and requests still queued on the old one finish there. Keys, cache, and model versions stay, but a model id whose `base_url`, `api`, or `upstream` changed forgets its resolved version, so answers cached for the old target are not served for it. A model with no known version uses `id@target` in the cache key, a request that started before the reload never reads the new target's version, and a late answer from the old target records nothing. `config.toml` is read only at start.
+
 **Catalog entry**
 
 ```toml
@@ -316,7 +318,7 @@ s1 forecast -m <model> --csv sales.csv --id sku --time ds --value y -h 28
 s1 models
 s1 status
 s1 util raw systemone < body.json     # pure passthrough
-s1 util daemon start|stop|logs
+s1 util daemon start|stop|reload|logs
 ```
 
 **Streaming filter mode** (when stdin is not a terminal, or with `--jsonl`):

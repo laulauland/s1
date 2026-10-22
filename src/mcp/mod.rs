@@ -58,7 +58,7 @@ const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 const META_CAPS: &str = "io.modelcontextprotocol/clientCapabilities";
 const META_SERVER: &str = "io.modelcontextprotocol/serverInfo";
 
-pub fn routes() -> Router<AppState> {
+pub fn routes() -> Router<crate::daemon::reload::Shared> {
     Router::new()
         .route("/mcp", post(handle).get(not_allowed).delete(not_allowed))
         .layer(DefaultBodyLimit::max(MAX_BODY))

@@ -1,6 +1,6 @@
-//! `~/.config/s1/config.toml`: listeners, queue sizes, cache size, and log
-//! level. Unknown top-level keys are ignored; unknown keys inside `[queue]`
-//! and `[cache]` are errors.
+//! `~/.config/s1/config.toml`: listeners, queue sizes, cache size, log
+//! level, and `watch_models`. Unknown top-level keys are ignored; unknown
+//! keys inside `[queue]` and `[cache]` are errors.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -21,6 +21,9 @@ pub struct Config {
     /// Queue bounds per backend and key.
     pub queue: Bounds,
     pub cache: CacheConfig,
+    /// Reload `models.toml` when it changes (polled). Off: only SIGHUP and
+    /// `s1 util daemon reload` reload it.
+    pub watch_models: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -37,6 +40,7 @@ impl Default for Config {
             log_level: "info".into(),
             queue: Bounds::default(),
             cache: CacheConfig::default(),
+            watch_models: true,
         }
     }
 }
@@ -110,6 +114,8 @@ mod tests {
         assert_eq!(c.queue, Bounds::default());
         assert!(c.cache.enabled);
         assert_eq!(c.cache.max_bytes, 1 << 30);
+        assert!(c.watch_models);
+        assert!(!Config::parse("watch_models = false").unwrap().watch_models);
     }
 
     #[test]

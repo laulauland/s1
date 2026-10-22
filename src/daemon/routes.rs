@@ -4,9 +4,16 @@
 use axum::Router;
 use axum::routing::get;
 
-use super::{AppState, cache, ingress, models, raw, status};
+use super::reload::Shared;
+use super::{AppState, cache, ingress, models, raw, reload, status};
 
+/// The router over one fixed state (nothing reloads it).
 pub fn router(state: AppState) -> Router {
+    router_for(Shared::new(state))
+}
+
+/// The router over a reloadable state.
+pub fn router_for(shared: Shared) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(models::routes())
@@ -14,8 +21,9 @@ pub fn router(state: AppState) -> Router {
         .merge(cache::routes())
         .merge(raw::routes())
         .merge(ingress::routes())
+        .merge(reload::routes())
         .merge(crate::mcp::routes())
-        .with_state(state)
+        .with_state(shared)
 }
 
 /// Whether systemd passed the listeners (see [`super::activation`]).

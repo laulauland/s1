@@ -9,7 +9,7 @@ use super::AppState;
 use crate::catalog::ModelState;
 use crate::limits::headers::rfc3339;
 
-pub fn routes() -> Router<AppState> {
+pub fn routes() -> Router<crate::daemon::reload::Shared> {
     Router::new().route("/v1/models", get(list))
 }
 

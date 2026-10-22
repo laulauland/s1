@@ -31,12 +31,25 @@ mod decode;
 pub(crate) mod ingress;
 pub(crate) mod models;
 pub(crate) mod raw;
+pub mod reload;
 mod routes;
 mod serve;
 mod status;
 
 pub use raw::MAX_BODY;
-pub use routes::router;
+pub use routes::{router, router_for};
+
+/// What each model id points at ([`crate::cache::model_target`]).
+pub(crate) fn model_targets(catalog: &Catalog) -> Vec<(String, String)> {
+    catalog
+        .models()
+        .map(|m| {
+            let target =
+                crate::cache::model_target(&m.provider.base_url, m.api().as_str(), m.upstream());
+            (m.id(), target)
+        })
+        .collect()
+}
 
 /// Shared state of all handlers.
 #[derive(Clone)]
@@ -53,6 +66,14 @@ pub struct AppState {
     /// Which image URLs s1 fetches toward systemone (public HTTPS only by
     /// default).
     pub image_fetch: crate::translate::fetch::FetchPolicy,
+    /// HTTP client and keys the backends share; reused on reload.
+    pub backend_ctx: BackendContext,
+    /// The `models.toml` overlay this catalog came from; `None` for a fixed
+    /// catalog (nothing to reload).
+    pub models_file: Option<PathBuf>,
+    /// How often to look for changes to `models_file`; `None`: only on
+    /// SIGHUP and `POST /reload`.
+    pub models_poll: Option<std::time::Duration>,
 }
 
 impl AppState {
@@ -69,6 +90,37 @@ impl AppState {
             cache: None,
             versions: Arc::new(Versions::in_memory()),
             image_fetch: crate::translate::fetch::FetchPolicy::PUBLIC_HTTPS,
+            backend_ctx: ctx,
+            models_file: None,
+            models_poll: None,
+        }
+    }
+
+    /// Reload the catalog from this file (see [`reload`]), and watch it.
+    pub fn with_models_file(mut self, file: PathBuf) -> Self {
+        self.models_file = Some(file);
+        self.models_poll = Some(reload::POLL_EVERY);
+        self
+    }
+
+    /// Change how often `models_file` is checked (`None`: never).
+    pub fn with_models_poll(mut self, every: Option<std::time::Duration>) -> Self {
+        self.models_poll = every;
+        self
+    }
+
+    /// The same state with another catalog: new backends, and protection
+    /// that keeps the schedulers of providers whose limits did not change.
+    /// Keys, cache, versions, and the HTTP client stay.
+    pub(crate) fn with_catalog(&self, catalog: Catalog) -> Self {
+        self.versions.set_targets(model_targets(&catalog));
+        let backends = Registry::from_catalog(&catalog, &self.backend_ctx);
+        let protection = Arc::new(self.protection.reloaded(&catalog));
+        Self {
+            catalog: Arc::new(catalog),
+            backends,
+            protection,
+            ..self.clone()
         }
     }
 
@@ -104,7 +156,11 @@ impl AppState {
     ) -> Result<Self, DaemonError> {
         let mut st = Self::new(catalog, keys)
             .with_bounds(config.queue)
-            .with_versions(Versions::load(&paths.versions_file()));
+            .with_versions(Versions::load(&paths.versions_file()))
+            .with_models_file(paths.models_file());
+        if !config.watch_models {
+            st = st.with_models_poll(None);
+        }
         if config.cache.enabled {
             let cache = Cache::open(&paths.cache_file(), config.cache.max_bytes)
                 .map_err(|e| DaemonError::Setup(e.to_string()))?;
@@ -202,9 +258,20 @@ pub struct RunningServer {
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<std::io::Result<()>>>,
     lifecycle: Lifecycle,
+    shared: reload::Shared,
 }
 
 impl RunningServer {
+    /// Reload `models.toml` now (as SIGHUP and `POST /reload` do).
+    pub fn reload(&self) -> Result<reload::ReloadOutcome, String> {
+        self.shared.reload()
+    }
+
+    /// The catalog state shown in `/status`.
+    pub fn catalog_status(&self) -> reload::CatalogStatus {
+        self.shared.status()
+    }
+
     /// Stop accepting, finish open requests, remove the socket file (only
     /// the one this server made) and its `daemon.json`, then release the
     /// lifecycle lock.
@@ -304,20 +371,23 @@ fn start(
 ) -> RunningServer {
     // `/health` tells `s1 util daemon stop` that systemd owns the listeners.
     let activated = routes::SocketActivated(lifecycle._lock.is_none());
-    let app: Router = router(opts.state).layer(Extension(activated));
+    let shared = reload::Shared::new(opts.state);
+    let app: Router = router_for(shared.clone()).layer(Extension(activated));
     let tcp_app = auth::require_bearer(app.clone(), opts.token);
     // Only the socket may name local image files (see `crate::images`).
     let app = app.layer(Extension(Origin::UnixSocket));
     let (stop, rx) = watch::channel(false);
 
     let unix_task = tokio::spawn(serve::serve_until(unix, app, rx.clone()));
+    let watcher = reload::spawn_watcher(shared.clone(), rx.clone());
     let tcp_task = tokio::spawn(serve::serve_until(tcp, tcp_app, rx));
     RunningServer {
         socket: opts.socket,
         tcp: tcp_addr,
         stop,
-        tasks: vec![unix_task, tcp_task],
+        tasks: [unix_task, tcp_task].into_iter().chain(watcher).collect(),
         lifecycle,
+        shared,
     }
 }
 
@@ -462,6 +532,7 @@ pub async fn run(
     paths: Paths,
     inherited: Option<activation::Inherited>,
 ) -> Result<(), DaemonError> {
+    let mut signals = Signals::install()?;
     let config =
         Config::load(&paths.config_file()).map_err(|e| DaemonError::Setup(e.to_string()))?;
     let tcp = config.tcp_addr().map_err(DaemonError::Setup)?;
@@ -480,7 +551,6 @@ pub async fn run(
     let models = catalog.models().count();
     let state = AppState::from_config(catalog, keys, &config, &paths)?;
     let activated = inherited.is_some();
-    let mut signals = Signals::install()?;
     let server = match inherited {
         Some(listeners) => {
             serve_inherited(listeners, state, token, Some(&paths.daemon_file())).await?
@@ -517,7 +587,7 @@ pub async fn run(
         );
     }
 
-    signals.wait_for_stop().await;
+    signals.wait_for_stop(&server).await;
     tracing::info!(event = "daemon_stop", "s1 daemon stopping");
     // Open requests finish first; with socket activation, new connections
     // wait in systemd's listen backlog for the next daemon.
@@ -526,11 +596,12 @@ pub async fn run(
     Ok(())
 }
 
-/// SIGTERM and SIGINT, installed before the listeners serve: a signal that
-/// comes right after start still drains instead of killing the process.
+/// The daemon's signal handlers, installed before it serves: SIGHUP's
+/// default action would end the process.
 struct Signals {
     term: tokio::signal::unix::Signal,
     int: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
 }
 
 impl Signals {
@@ -541,13 +612,25 @@ impl Signals {
         Ok(Self {
             term: signal(SignalKind::terminate()).map_err(fail)?,
             int: signal(SignalKind::interrupt()).map_err(fail)?,
+            hup: signal(SignalKind::hangup()).map_err(fail)?,
         })
     }
 
-    async fn wait_for_stop(&mut self) {
-        tokio::select! {
-            _ = self.term.recv() => {}
-            _ = self.int.recv() => {}
+    /// Reload `models.toml` on each SIGHUP; return on SIGTERM or SIGINT.
+    async fn wait_for_stop(&mut self, server: &RunningServer) {
+        loop {
+            tokio::select! {
+                _ = self.term.recv() => return,
+                _ = self.int.recv() => return,
+                _ = self.hup.recv() => {
+                    // Off this loop, so SIGTERM is seen during a slow
+                    // reload. The outcome is logged and kept for /status.
+                    let shared = server.shared.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = shared.reload();
+                    });
+                }
+            }
         }
     }
 }

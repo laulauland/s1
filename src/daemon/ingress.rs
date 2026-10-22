@@ -48,7 +48,7 @@ use crate::queue::Lane;
 use crate::router::{LONG_CONTEXT_HEADER, RequestFlags, Router as ModelRouter};
 use crate::translate::{self, NameMap, Translated};
 
-pub fn routes() -> Router<AppState> {
+pub fn routes() -> Router<crate::daemon::reload::Shared> {
     Router::new()
         .route(
             "/v1/systemone",
@@ -227,7 +227,16 @@ pub async fn handle(
         )
         .ok()
     };
-    let version = st.versions.current(&route.model_id);
+    // What the model id pointed at for this request (see `Versions`).
+    let target = cache::model_target(
+        st.catalog
+            .providers
+            .get(&route.provider)
+            .map_or("", |p| p.base_url.as_str()),
+        route.api.as_str(),
+        &route.upstream,
+    );
+    let version = st.versions.current(&route.model_id, &target);
     if let Some(c) = cache.as_ref().filter(|_| mode.lookup())
         && let Some(k) = key_for(&version)
     {
@@ -344,7 +353,7 @@ pub async fn handle(
             };
             if resp.status.is_success() {
                 if let Some(v) = &resolved {
-                    st.versions.record(&route.model_id, v);
+                    st.versions.record(&route.model_id, &target, v);
                 }
                 if let Some(c) = &cache
                     && mode.store()

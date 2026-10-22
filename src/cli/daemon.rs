@@ -1,4 +1,4 @@
-//! `s1 util daemon start|stop|logs` (and the hidden `run`, the daemon itself).
+//! `s1 util daemon start|stop|reload|logs` (and the hidden `run`, the daemon itself).
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -15,6 +15,9 @@ pub enum DaemonCmd {
     Start,
     /// Stop the running daemon.
     Stop,
+    /// Load ~/.config/s1/models.toml again (the daemon also does this when
+    /// the file changes, and on SIGHUP).
+    Reload,
     /// Print the end of the newest log file.
     Logs {
         /// Number of lines.
@@ -37,6 +40,7 @@ pub fn run(cmd: DaemonCmd, paths: &Paths) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         DaemonCmd::Stop => stop(paths),
+        DaemonCmd::Reload => reload(paths),
         DaemonCmd::Logs { lines } => logs(paths, lines),
         DaemonCmd::Run => {
             // SAFETY: no other thread exists yet; the runtime starts below.
@@ -130,6 +134,50 @@ fn zombie(pid: i32) -> bool {
     stat.rsplit_once(')')
         .and_then(|(_, rest)| rest.split_whitespace().next())
         == Some("Z")
+}
+
+/// `POST /reload` on the socket; print what changed, or why nothing did.
+fn reload(paths: &Paths) -> Result<ExitCode, String> {
+    if !is_running(&paths.socket) {
+        return Err("s1 daemon is not running".into());
+    }
+    let rt = super::runtime()?;
+    let reply = rt.block_on(super::client::request(
+        &paths.socket,
+        axum::http::Method::POST,
+        "/reload",
+        axum::http::HeaderMap::new(),
+        bytes::Bytes::new(),
+    ))?;
+    let body: serde_json::Value = serde_json::from_slice(&reply.body)
+        .map_err(|e| format!("daemon /reload answer is not JSON: {e}"))?;
+    if !reply.status.is_success() {
+        let msg = body["error"]["message"].as_str().unwrap_or("reload failed");
+        return Err(format!("{msg}; the previous catalog stays in use"));
+    }
+    let models = body["models"].as_u64().unwrap_or(0);
+    if body["changed"].as_bool() == Some(true) {
+        println!("catalog reloaded: {models} models");
+        let ids = |k: &str| -> Vec<String> {
+            body[k]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for id in ids("added") {
+            println!("  + {id}");
+        }
+        for id in ids("removed") {
+            println!("  - {id}");
+        }
+    } else {
+        println!("catalog unchanged: {models} models");
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn logs(paths: &Paths, lines: usize) -> Result<ExitCode, String> {
